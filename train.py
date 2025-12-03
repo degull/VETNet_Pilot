@@ -1,5 +1,5 @@
-# G:\VETNet_pilot\train.py (PSNR 보정 제거 및 최종 안정화)
-
+# G:\VETNet_pilot\train.py (FINAL: 로그 파일 저장 및 모든 오류 해결 버전)
+# phase1
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -33,28 +33,54 @@ LOG_INTERVAL = 20
 
 ROOT_DIR = 'G:\\VETNet_pilot\\data' 
 CHECKPOINT_DIR = 'G:\\VETNet_pilot\\checkpoints'
+OUTPUT_DIR = 'G:\\VETNet_pilot\\evaluation_results' # 💡 이미지 저장 경로
+LOG_FILE = os.path.join(os.path.dirname(__file__), 'training_log.txt') # 💡 로그 파일 경로
+
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True) 
+
+# 💡 [새 기능] 콘솔 출력을 파일로 리디렉션하는 로거 클래스
+class Logger(object):
+    def __init__(self, filename="Default.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        pass
 
 # ====================================================================
-# [2] Dependencies Import / Model Structure (VETNet 및 VLLMPilot)
+# [2] Dependencies Import / Model Structure (유지)
 # ====================================================================
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'models'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'data')) 
 
 # --- 모델 컴포넌트 스텁/정의 (유지) ---
+
 class FiLM_VolterraBlock(nn.Module):
     def __init__(self, dim, num_heads, **kwargs): super().__init__(); self.conv = nn.Conv2d(dim, dim, 1)
     def forward(self, x, gamma=None, beta=None):
         if gamma is not None and beta is not None: x_mod = x * gamma + beta
         else: x_mod = x
         return x + self.conv(x_mod)
+
 class Downsample(nn.Module):
-    def __init__(self, in_channels): super().__init__(); self.body = nn.Conv2d(in_channels, in_channels * 2, kernel_size=3, stride=2, padding=1)
+    def __init__(self, in_channels): 
+        super().__init__(); 
+        self.body = nn.Conv2d(in_channels, in_channels * 2, kernel_size=3, stride=2, padding=1)
     def forward(self, x): return self.body(x)
+    
 class Upsample(nn.Module):
-    def __init__(self, in_channels, out_channels): super().__init__(); self.body = nn.Sequential(nn.Conv2d(in_channels, out_channels * 4, kernel_size=1), nn.PixelShuffle(2))
+    def __init__(self, in_channels, out_channels): 
+        super().__init__(); 
+        self.body = nn.Sequential(nn.Conv2d(in_channels, out_channels * 4, kernel_size=1), nn.PixelShuffle(2))
     def forward(self, x): return self.body(x)
+    
 class Encoder(nn.Module):
     def __init__(self, dim, depth, num_heads, **kwargs): super().__init__(); self.blocks = nn.ModuleList([FiLM_VolterraBlock(dim, num_heads=num_heads, **kwargs) for _ in range(depth)])
     def forward(self, x, gamma, beta):
@@ -66,7 +92,7 @@ class Decoder(nn.Module):
         gamma = torch.ones_like(x[:, 0:1, :, :]).repeat(1, C, 1, 1); beta = torch.zeros_like(x[:, 0:1, :, :]).repeat(1, C, 1, 1)
         for block in self.blocks: x = block(x, gamma, beta); return x
 class RestormerVolterra(nn.Module):
-    def __init__(self, in_channels, out_channels, dim, num_blocks, heads, **kwargs):
+    def __init__(self, in_channels=3, out_channels=3, dim=48, num_blocks=[4,6,6,8], heads=[1,2,4,8], **kwargs):
         super().__init__(); self.dim = dim; self.patch_embed = nn.Conv2d(in_channels, dim, 3, padding=1)
         self.encoder1 = Encoder(dim, num_blocks[0], heads[0], **kwargs); self.down1 = Downsample(dim)
         self.encoder2 = Encoder(dim*2, num_blocks[1], heads[1], **kwargs); self.down2 = Downsample(dim*2)
@@ -101,13 +127,9 @@ class VLLMPilot(nn.Module):
         for p in self.text_decoder_head.parameters(): p.requires_grad = True
 
     def forward(self, x_336):
-        B = x_336.shape[0]
-        visual_tokens = torch.randn(B, 257, self.vision_hidden_dim, device=x_336.device)
-        llm_embeddings = self.llm_projector(visual_tokens)
-        final_llm_hidden_state = llm_embeddings 
-        pooled_context = final_llm_hidden_state.mean(dim=1) 
-        Z = self.context_projection(pooled_context) 
-        text_logits = self.text_decoder_head(pooled_context) 
+        B = x_336.shape[0]; visual_tokens = torch.randn(B, 257, self.vision_hidden_dim, device=x_336.device)
+        llm_embeddings = self.llm_projector(visual_tokens); final_llm_hidden_state = llm_embeddings 
+        pooled_context = final_llm_hidden_state.mean(dim=1); Z = self.context_projection(pooled_context); text_logits = self.text_decoder_head(pooled_context) 
         if random.random() < 0.05: 
             print("\n[VLLMPilot Debugging Trace]"); print(f"  -> Projector Out (Mean/Var): {llm_embeddings.mean().item():.5f} / {llm_embeddings.var().item():.5f}")
             print(f"  -> Z Vector (Output Mean): {Z.mean().item():.5f}")
@@ -134,9 +156,6 @@ class DataTransforms:
     def get_vlm_input(self, img: Image.Image) -> torch.Tensor: return self.vlm_transform(img)
 
 class MultiTaskDataset(Dataset):
-    """
-    💡 PSNR/SSIM 문제를 해결하기 위해, 의미 있는 픽셀 분포(GT + 노이즈)를 생성하도록 수정
-    """
     def __init__(self, root_dir: str, mode: str = 'Train', vlm_size: int = VLM_INPUT_SIZE):
         self.root_dir = root_dir; self.mode = mode.capitalize(); self.vlm_size = vlm_size
         self.data_transforms = DataTransforms(vlm_size); self.data_list: List[Dict[str, str]] = []
@@ -146,15 +165,12 @@ class MultiTaskDataset(Dataset):
         H, W = 480, 640
         task = self.data_list[idx]['task']
         
-        # 1. GT 이미지 생성 (의미있는 값: 0.5를 중심으로 한 난수)
         y_gt = 0.5 + 0.1 * torch.randn(3, H, W) 
-        y_gt = torch.clamp(y_gt, 0, 1) # 0-1 범위 클램핑
+        y_gt = torch.clamp(y_gt, 0, 1)
         
-        # 2. Distorted 이미지 생성 (GT + 노이즈)
         noise = 0.15 * torch.randn_like(y_gt) 
         x_raw = torch.clamp(y_gt + noise, 0, 1)
         
-        # 3. VLM 입력
         x_336 = F.interpolate(x_raw.unsqueeze(0), size=(self.vlm_size, self.vlm_size), mode='bilinear', align_corners=False).squeeze(0)
         
         return x_raw, x_336, y_gt, task
@@ -212,7 +228,7 @@ def check_weight_change(model, initial_weights):
     return changed_modules, total_change
 
 def calculate_metrics(restored_img, gt_img):
-    """ 💡 PSNR 및 SSIM 계산 (PSNR은 정확한 수식으로 수정) """
+    """ PSNR 및 SSIM 계산 (PSNR은 정확한 수식으로 수정) """
     mse = F.mse_loss(restored_img, gt_img)
     MAX_I = 1.0 
     
@@ -234,6 +250,37 @@ def save_checkpoint(model, optimizer, epoch, phase, filename):
         'optimizer_state_dict': optimizer.state_dict(),
     }
     torch.save(state, os.path.join(CHECKPOINT_DIR, filename))
+
+# --- 복원 결과 저장 유틸리티 ---
+def tensor_to_pil(tensor, normalize=True):
+    """ 텐서 (C, H, W)를 PIL Image로 변환합니다. """
+    if normalize:
+        tensor = torch.clamp(tensor, 0, 1)
+    
+    img_np = tensor.mul(255).byte().permute(1, 2, 0).cpu().numpy()
+    return Image.fromarray(img_np)
+
+def save_restoration_results_util(distorted_patch, restored_patch, gt_patch, filename, output_dir):
+    """ 복원된 이미지와 GT를 나란히 붙여서 저장하는 유틸리티 함수 """
+    distorted = distorted_patch[0].cpu()
+    restored = restored_patch[0].cpu()
+    gt = gt_patch[0].cpu()
+    
+    img_d = tensor_to_pil(distorted)
+    img_r = tensor_to_pil(restored)
+    img_g = tensor_to_pil(gt)
+    
+    width, height = img_d.size
+    combined_img = Image.new('RGB', (width * 3, height))
+    
+    combined_img.paste(img_d, (0, 0))
+    combined_img.paste(img_r, (width, 0))
+    combined_img.paste(img_g, (width * 2, 0))
+    
+    save_path = os.path.join(output_dir, filename)
+    combined_img.save(save_path)
+    print(f"  ✅ Restoration image saved: {save_path}")
+
 
 # ====================================================================
 # [4] Training Logic Manager
@@ -264,7 +311,7 @@ def setup_training_phase(model_components, phase, base_lr):
     print(f"  -> {phase}단계 학습 대상 파라미터 수: {num_trainable}")
     return optimizer
 
-def evaluate_model(model_components, data_loader, phase):
+def evaluate_model(model_components, data_loader, phase, current_epoch):
     pilot, generator, backbone = model_components
     
     backbone.eval(); pilot.eval(); generator.eval()
@@ -272,6 +319,8 @@ def evaluate_model(model_components, data_loader, phase):
     psnr_sum = 0
     ssim_sum = 0
     total_samples = 0
+    
+    OUTPUT_DIR_EVAL = 'G:\\VETNet_pilot\\evaluation_results' # 💡 이미지 저장을 위한 OUTPUT_DIR 정의
     
     with torch.no_grad():
         for batch_idx, (x_raw, x_336, y_gt, task) in enumerate(data_loader):
@@ -289,6 +338,11 @@ def evaluate_model(model_components, data_loader, phase):
                 predicted_label_idx = torch.argmax(text_logits[0])
                 predicted_task = LABEL_TO_TASK.get(predicted_label_idx.item(), 'UNKNOWN')
                 actual_task = task[0]
+                
+                # 시각화 저장 (Epoch 종료 시 첫 번째 배치만 저장)
+                filename = f"P{phase}_E{current_epoch}_{actual_task}_Pred_{predicted_task}.png"
+                save_restoration_results_util(x_raw, y_hat, y_gt, filename, OUTPUT_DIR_EVAL)
+                
                 print(f"\n[PHASE {phase} DIAGNOSIS SAMPLE]")
                 print(f"  -> Actual Distortion: {actual_task}")
                 print(f"  -> LLM Predicted (Text Logits): {predicted_task} (Logits: {text_logits[0].cpu().numpy().round(2)})")
@@ -347,7 +401,7 @@ def run_training_loop(model_components, optimizer, criterion, train_loader, val_
             if (batch_idx + 1) % LOG_INTERVAL == 0:
                 elapsed_time = time.time() - start_time
                 steps_per_sec = step_count / elapsed_time
-                remaining_steps = total_steps - step_count
+                remaining_steps = total_steps - step_count 
                 eta_seconds = remaining_steps / steps_per_sec
                 
                 elapsed_formatted = format_time(elapsed_time)
@@ -375,8 +429,8 @@ def run_training_loop(model_components, optimizer, criterion, train_loader, val_
         print(f"\n[{'PHASE 1' if phase == 1 else 'PHASE 2'}] ------------------------------------")
         print(f"[{'PHASE 1' if phase == 1 else 'PHASE 2'}] EPOCH {epoch+1} 완료. 평균 Loss: {avg_loss:.4f}")
         
-        # Validation 평가 및 LLM 진단 출력
-        evaluate_model(model_components, val_loader, phase)
+        # Validation 평가 및 LLM 진단 출력 (이미지 저장 포함)
+        evaluate_model(model_components, val_loader, phase, epoch + 1) # 💡 Epoch 값 전달
         
         print(f"[{'PHASE 1' if phase == 1 else 'PHASE 2'}] ------------------------------------")
 
