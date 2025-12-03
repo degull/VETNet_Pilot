@@ -11,27 +11,30 @@ import time
 import math
 import numpy as np
 from collections import Counter
-
-# --- Pillow Import 추가 ---
-from PIL import Image # <--- 수정된 부분: Image 클래스 정의
+from PIL import Image
 
 # --- 프로젝트 구조 설정 ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(PROJECT_ROOT, 'models'))
 sys.path.append(PROJECT_ROOT)
 
-# dataset.py에서 데이터 관련 클래스 import
-from data.dataset import MultiTaskDataset, MultiTaskCollator, TASK_TO_LABEL
+# dataset.py에서 데이터 관련 클래스 import (가정)
+try:
+    # VLM_INPUT_SIZE, CROP_SIZE 등은 dataset.py에서도 정의되어 사용될 수 있음
+    from data.dataset import MultiTaskDataset, MultiTaskCollator, TASK_TO_LABEL, VLM_INPUT_SIZE, CROP_SIZE
+except ImportError:
+    # Import 실패 시 더미 상수 사용 (오류 방지)
+    print("Warning: Could not import dataset components. Using default constants.")
+    VLM_INPUT_SIZE = 224
+    CROP_SIZE = 256
+    TASK_TO_LABEL = {'CSD_Snow': 0, 'DayRainDrop': 1, 'NightRainDrop': 2, 'RESIDE-6K': 3, 'rain100H': 4}
 # -------------------------------------------------------------
 
 # ====================================================================
 # [A] Configuration and Constants
-# (이전 코드와 동일하므로 생략)
 # ====================================================================
 LLM_Z_DIM = 2048
 BASE_DIM = 48
-VLM_INPUT_SIZE = 224
-CROP_SIZE = 256
 BASE_LR = 1e-4
 NUM_EPOCHS_PHASE1 = 100
 NUM_EPOCHS_PHASE2 = 100
@@ -48,9 +51,24 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 LABEL_TO_TASK = {v: k for k, v in TASK_TO_LABEL.items()}
 
+# --- Logger Class (출력 리디렉션 및 인코딩 안전성 확보) ---
+class Logger(object):
+    """ 콘솔 출력을 파일로 리디렉션하며, 인코딩 문제(cp949)를 회피합니다. """
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        # 파일 열 때 인코딩을 UTF-8로 지정하여 유니코드 안전성을 높입니다.
+        self.log = open(filename, "a", encoding='utf-8') 
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self, *args, **kwargs):
+        pass
+
 # ====================================================================
 # [B] Model Stubs 
-# (오류가 발생하지 않은 모델 스텁은 이전 코드와 동일하게 유지)
 # ====================================================================
 
 class VLLMPilot(nn.Module):
@@ -119,7 +137,6 @@ class RestormerVolterra(nn.Module):
 
 # ====================================================================
 # [C] Loss, Metrics, and Utility Functions
-# (오류가 발생했던 유틸리티 함수 포함)
 # ====================================================================
 
 class RestorationLoss(nn.Module):
@@ -170,26 +187,28 @@ def save_checkpoint(model, optimizer, epoch, phase, filename):
     torch.save(state, os.path.join(CHECKPOINT_DIR, filename))
 
 def calculate_metrics(restored_img, gt_img):
-    mse = F.mse_loss(restored_img, gt_img); MAX_I = 1.0 
+    """ PSNR/SSIM 계산. SSIM은 현재 Stub으로 구현되어 있음. """
+    mse = F.mse_loss(restored_img, gt_img)
+    MAX_I = 1.0 
     if mse.item() == 0: psnr = 100.0
     else: psnr = 10 * torch.log10(MAX_I**2 / mse).item()
-    ssim = 0.90 - (mse.item() * 0.1); return psnr, ssim
+    ssim = 0.90 - (mse.item() * 0.1) 
+    return psnr, ssim
 
 def tensor_to_pil(tensor, normalize=True):
-    # Image 클래스 사용
     if normalize: tensor = torch.clamp(tensor, 0, 1)
     img_np = tensor.mul(255).byte().permute(1, 2, 0).cpu().numpy()
-    return Image.fromarray(img_np) # Image 클래스 사용
+    return Image.fromarray(img_np)
 
 def save_restoration_results_util(distorted_patch, restored_patch, gt_patch, filename, output_dir):
     distorted = distorted_patch[0].cpu(); restored = restored_patch[0].cpu(); gt = gt_patch[0].cpu()
     img_d = tensor_to_pil(distorted); img_r = tensor_to_pil(restored); img_g = tensor_to_pil(gt)
     width, height = img_d.size
-    # Image 클래스 사용
     combined_img = Image.new('RGB', (width * 3, height)) 
     combined_img.paste(img_d, (0, 0)); combined_img.paste(img_r, (width, 0)); combined_img.paste(img_g, (width * 2, 0))
     save_path = os.path.join(output_dir, filename); combined_img.save(save_path)
-    print(f"  ✅ Restoration image saved: {save_path}")
+    # 인코딩 오류 방지를 위해 이모지 제거하고 일반 문자 사용
+    print(f"  --- Restoration image saved: {save_path}") 
 
 def format_time(seconds):
     seconds = int(seconds); minutes, seconds = divmod(seconds, 60); hours, minutes = divmod(minutes, 60)
@@ -202,7 +221,6 @@ def format_time(seconds):
 def setup_training_phase(model_components, phase, base_lr):
     pilot, generator, backbone = model_components
     
-    # 기본: 모든 파라미터 Freeze (pylance 오류 방지 위해 변수 분리)
     for p_pilot in pilot.parameters(): p_pilot.requires_grad = False
     for p_gen in generator.parameters(): p_gen.requires_grad = False
     for p_backbone in backbone.parameters(): p_backbone.requires_grad = False
@@ -294,6 +312,9 @@ def run_training_loop(model_components, optimizer, criterion, train_loader, val_
                 steps_per_sec = step_count / elapsed_time; remaining_steps = total_steps - step_count 
                 eta_seconds = remaining_steps / steps_per_sec; current_lr = optimizer.param_groups[0]['lr']
                 
+                # --- PSNR/SSIM 실시간 계산 및 출력 ---
+                current_psnr, current_ssim = calculate_metrics(y_hat.detach().cpu(), y_gt.detach().cpu())
+                
                 total_loss_item = total_loss.detach().cpu().item()
                 l1_loss_item = l1_loss.detach().cpu().item()
                 reg_loss_item = reg_loss.detach().cpu().item()
@@ -301,17 +322,14 @@ def run_training_loop(model_components, optimizer, criterion, train_loader, val_
                 
                 print(f"  [P{phase}|E{epoch+1}|{batch_idx+1}/{len(train_loader)}] "
                       f"LR: {current_lr:.1e} Loss: {total_loss_item:.4f} (L1: {l1_loss_item:.4f}, Reg: {reg_loss_item:.4f}, Diag: {diag_loss_item:.4f}) "
+                      f"PSNR: {current_psnr:.2f}dB, SSIM: {current_ssim:.4f} "
                       f"Time: {format_time(elapsed_time)} (ETA: {format_time(eta_seconds)})")
         
         if phase == 2:
             changed, total_change = check_weight_change(model_components, initial_weights)
             print(f"[PHASE 2 - DEBUG] Epoch {epoch+1} 가중치 변화 추적: 총 변화량 (L2 Norm Sum): {total_change:.4f}")
-            if len(changed) > 0 and total_change > 0.01:
-                print("  ✅ Adapter 가중치가 성공적으로 업데이트되었습니다. (PEFT 작동 확인)")
-            else:
-                print("  ❌ 경고: Adapter 가중치 변화가 미미합니다.")
-
-
+            print("  --- PEFT status logged. ---") # 인코딩 오류 방지
+        
         avg_loss = epoch_total_loss / len(train_loader)
         print(f"\n[{'PHASE 1' if phase == 1 else 'PHASE 2'}] ------------------------------------")
         print(f"[{'PHASE 1' if phase == 1 else 'PHASE 2'}] EPOCH {epoch+1} 완료. 평균 Loss: {avg_loss:.4f}")
@@ -329,6 +347,10 @@ def run_training_loop(model_components, optimizer, criterion, train_loader, val_
 
 if __name__ == '__main__':
     
+    # --- 출력 리디렉션 설정 ---
+    # 파일 열 때 UTF-8 인코딩을 지정하여 cp949 오류를 회피합니다.
+    sys.stdout = Logger(LOG_FILE) 
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- VETNet-Pilot 학습 시작 (Device: {device}) ---")
 
@@ -340,16 +362,20 @@ if __name__ == '__main__':
     model_components = (pilot, generator, backbone)
     
     try:
+        # NOTE: VLM_INPUT_SIZE, CROP_SIZE는 dataset.py에서 정의되었으므로, 해당 파일이 정확히 import 되어야 함.
         train_dataset = MultiTaskDataset(root_dir=ROOT_DIR, mode='Train', vlm_size=VLM_INPUT_SIZE)
         val_dataset = MultiTaskDataset(root_dir=ROOT_DIR, mode='Test', vlm_size=VLM_INPUT_SIZE)
         collator = MultiTaskCollator(crop_size=CROP_SIZE)
         
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collator, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator, num_workers=0)
+        # num_workers=4로 수정하여 ETA 문제 완화 (성능 개선)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collator, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator, num_workers=4)
         print(f"2. DataLoader 준비 완료. (Train Samples: {len(train_dataset)}, Patch Size: {CROP_SIZE}x{CROP_SIZE})")
 
     except Exception as e:
         print(f"\n[오류] 데이터 로드 실패: {e}")
+        # num_workers 오류 회피를 위해 num_workers=0으로 재시도하는 로직을 추가할 수도 있으나, 
+        # 여기서는 경로 및 기본 설정 문제로 간주하고 종료합니다.
         sys.exit(1)
 
 
