@@ -80,7 +80,7 @@ class VETNetBackbone(nn.Module):
         dim=48,
         num_blocks=(4, 6, 6, 8),
         heads=(1, 2, 4, 8),
-        volterra_rank=4,
+        volterra_rank=2,
         ffn_expansion_factor=2.66,
         bias=False,
     ):
