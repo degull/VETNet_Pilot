@@ -1,74 +1,148 @@
-# datasets/utils_dataset.py
-
+# G:/VETNet_pilot/datasets/utils_dataset.py
 import os
-from glob import glob
+from PIL import Image
 
-def build_all_pairs(data_root):
+IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+
+def is_img(path):
+    return os.path.splitext(path)[-1].lower() in IMG_EXT
+
+
+# -----------------------------------------------------------
+# 로딩: PIL 이미지 반환
+# -----------------------------------------------------------
+def load_image(path):
+    """경로에서 이미지를 RGB로 로딩"""
+    return Image.open(path).convert("RGB")
+
+
+# -----------------------------------------------------------
+# 전체 dataset pair 생성기
+# (이전 create_cache.py 와 동일한 pair 규칙 반영)
+# -----------------------------------------------------------
+def build_all_pairs(root):
     """
-    모든 데이터셋 pair를 (input_path, gt_path, tag) 형태로 반환
-    + 디버그 안전장치 포함
+    data_root 내부의 모든 데이터셋에서 (input, gt) 페어를 전부 찾는다.
+    반환 형태:
+        {
+            "DayRainDrop": [(in_path, gt_path), ...],
+            "NightRainDrop": [...],
+            ...
+        }
     """
+    all_pairs = {}
+
+    # ============ DayRainDrop ============ 
+    ds = "DayRainDrop"
+    day_root = os.path.join(root, ds)
+    drop_root = os.path.join(day_root, "Drop")
+    clear_root = os.path.join(day_root, "Clear")
     pairs = []
-
-    def add_pairs(input_dir, gt_dir, tag):
-        input_files = sorted(glob(os.path.join(input_dir, "*")))
-        gt_files    = sorted(glob(os.path.join(gt_dir, "*")))
-
-        if len(input_files) != len(gt_files):
-            print(f"[WARN] Mismatch count in {tag}: input={len(input_files)}, gt={len(gt_files)}")
-
-        for inp, gt in zip(input_files, gt_files):
-
-            # 파일 이름 검증
-            if not os.path.isfile(inp):
-                print(f"[ERROR] Not a file: {inp}")
+    if os.path.isdir(drop_root) and os.path.isdir(clear_root):
+        seq_dirs = sorted(os.listdir(drop_root))
+        for seq in seq_dirs:
+            drop_seq = os.path.join(drop_root, seq)
+            clear_seq = os.path.join(clear_root, seq)
+            if not (os.path.isdir(drop_seq) and os.path.isdir(clear_seq)):
                 continue
 
-            if not os.path.isfile(gt):
-                print(f"[ERROR] Not a file: {gt}")
+            # 첫 프레임만 사용
+            fname = "00001.png"
+            inp = os.path.join(drop_seq, fname)
+            gt  = os.path.join(clear_seq, fname)
+            if os.path.isfile(inp) and os.path.isfile(gt):
+                pairs.append((inp, gt))
+
+    all_pairs[ds] = pairs
+
+
+    # ============ NightRainDrop ============
+    ds = "NightRainDrop"
+    nr_root = os.path.join(root, ds)
+    drop_root = os.path.join(nr_root, "Drop")
+    clear_root = os.path.join(nr_root, "Clear")
+    pairs = []
+    if os.path.isdir(drop_root) and os.path.isdir(clear_root):
+        seq_dirs = sorted(os.listdir(drop_root))
+        for seq in seq_dirs:
+            drop_seq = os.path.join(drop_root, seq)
+            clear_seq = os.path.join(clear_root, seq)
+            if not (os.path.isdir(drop_seq) and os.path.isdir(clear_seq)):
                 continue
 
-            # 디버그 로그 추가
-            if len(inp) < 10:
-                print(f"[DEBUG WARNING] Strange input path: {inp}")
+            # 첫 프레임만 사용
+            fname = "00001.png"
+            inp = os.path.join(drop_seq, fname)
+            gt  = os.path.join(clear_seq, fname)
+            if os.path.isfile(inp) and os.path.isfile(gt):
+                pairs.append((inp, gt))
 
-            pairs.append((inp.replace("\\", "/"), gt.replace("\\", "/"), tag))
+    all_pairs[ds] = pairs
 
-    # ---------------------------------------------------------
-    # 1) DayRainDrop
-    # ---------------------------------------------------------
-    dr = os.path.join(data_root, "DayRainDrop")
-    add_pairs(os.path.join(dr, "Drop"),  os.path.join(dr, "Clear"), "DayRainDrop")
 
-    # ---------------------------------------------------------
-    # 2) NightRainDrop
-    # ---------------------------------------------------------
-    nr = os.path.join(data_root, "NightRainDrop")
-    add_pairs(os.path.join(nr, "Drop"),  os.path.join(nr, "Clear"), "NightRainDrop")
+    # ============ CSD (Train + Test) ============
+    ds = "CSD"
+    csd_root = os.path.join(root, ds)
+    pairs = []
+    for split in ["Train", "Test"]:
+        snow_dir = os.path.join(csd_root, split, "Snow")
+        gt_dir   = os.path.join(csd_root, split, "Gt")
+        if not (os.path.isdir(snow_dir) and os.path.isdir(gt_dir)):
+            continue
+        for f in sorted(os.listdir(snow_dir)):
+            inp = os.path.join(snow_dir, f)
+            gt  = os.path.join(gt_dir, f)
+            if os.path.isfile(inp) and os.path.isfile(gt) and is_img(inp):
+                pairs.append((inp, gt))
 
-    # ---------------------------------------------------------
-    # 3) Snow / CSD
-    # ---------------------------------------------------------
-    csd = os.path.join(data_root, "CSD", "Train")
-    add_pairs(os.path.join(csd, "Snow"), os.path.join(csd, "Gt"), "CSD")
+    all_pairs[ds] = pairs
 
-    # ---------------------------------------------------------
-    # 4) Rain100H
-    # ---------------------------------------------------------
-    r100h = os.path.join(data_root, "rain100H", "train")
-    add_pairs(os.path.join(r100h, "rain"), os.path.join(r100h, "norain"), "rain100H")
 
-    # ---------------------------------------------------------
-    # 5) RESIDE-6K (예: haze 제거)
-    # ---------------------------------------------------------
-    res = os.path.join(data_root, "RESIDE-6K", "train")
-    add_pairs(os.path.join(res, "hazy"), os.path.join(res, "clear"), "RESIDE-6K")
+    # ============ RESIDE-6K (train/test 공통) ============
+    ds = "RESIDE-6K"
+    reside_root = os.path.join(root, ds)
+    pairs = []
+    for split in ["train", "test"]:
+        hazy_dir = os.path.join(reside_root, split, "hazy")
+        gt_dir   = os.path.join(reside_root, split, "GT")
+        if not (os.path.isdir(hazy_dir) and os.path.isdir(gt_dir)):
+            continue
+        for f in sorted(os.listdir(hazy_dir)):
+            inp = os.path.join(hazy_dir, f)
+            gt  = os.path.join(gt_dir, f)
+            if os.path.isfile(inp) and os.path.isfile(gt) and is_img(inp):
+                pairs.append((inp, gt))
 
-    # ---------------------------------------------------------
-    print(f"[build_all_pairs] Final pairs = {len(pairs)}")
+    all_pairs[ds] = pairs
 
-    # pair 예시 출력
-    for i in range(5):
-        print("[PAIR]", pairs[i])
 
-    return pairs
+    # ============ rain100H ============
+    for ds in ["rain100H", "Rain100H"]:
+        base = os.path.join(root, ds)
+        train_root = os.path.join(base, "train")
+        if not os.path.isdir(train_root):
+            continue
+
+        # rain / no-rain 탐색
+        subdirs = os.listdir(train_root)
+        inp_dir = gt_dir = None
+        for d in subdirs:
+            dd = d.lower()
+            if "rain" in dd:
+                inp_dir = os.path.join(train_root, d)
+            if "gt" in dd or "norain" in dd:
+                gt_dir = os.path.join(train_root, d)
+
+        pairs = []
+        if inp_dir and gt_dir:
+            for f in sorted(os.listdir(inp_dir)):
+                inp = os.path.join(inp_dir, f)
+                gt  = os.path.join(gt_dir, f)
+                if os.path.isfile(inp) and os.path.isfile(gt) and is_img(inp):
+                    pairs.append((inp, gt))
+
+            all_pairs[ds] = pairs
+            break
+
+    return all_pairs

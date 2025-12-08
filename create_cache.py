@@ -22,6 +22,9 @@ def is_image_file(path):
 # ------------------------------------------------------------------
 # 1) DayRainDrop (Drop/xxx.png ↔ Clear/xxx.png)
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 1) DayRainDrop (Drop/00001/00001.png ↔ Clear/00001/00001.png, 첫 프레임만)
+# ------------------------------------------------------------------
 def collect_dayraindrop_pairs():
     """
     DayRainDrop 구조:
@@ -30,7 +33,7 @@ def collect_dayraindrop_pairs():
        Clear/00001/00001.png, 00002.png ...
        Drop/00001/00001.png, 00002.png ...
 
-    → 한 seq 폴더 안의 모든 frame을 pair 로 취급
+    → 각 seq 폴더에서 '00001.png' 한 장만 pair 로 사용
     """
 
     pairs = []
@@ -45,7 +48,7 @@ def collect_dayraindrop_pairs():
     print(f"[DayRainDrop Debug] root={root}")
 
     seq_dirs = sorted(os.listdir(drop_root))
-    total_count = 0
+    count = 0
 
     for seq in seq_dirs:
         drop_seq_dir = os.path.join(drop_root, seq)
@@ -54,24 +57,18 @@ def collect_dayraindrop_pairs():
         if not (os.path.isdir(drop_seq_dir) and os.path.isdir(clear_seq_dir)):
             continue
 
-        frame_files = sorted([
-            f for f in os.listdir(drop_seq_dir)
-            if is_image_file(os.path.join(drop_seq_dir, f))
-        ])
+        frame_name = "00001.png"  # ★ 첫 프레임만 사용
+        in_path = os.path.join(drop_seq_dir, frame_name)
+        gt_path = os.path.join(clear_seq_dir, frame_name)
 
-        for f in frame_files:
-            in_path = os.path.join(drop_seq_dir, f)
-            gt_path = os.path.join(clear_seq_dir, f)
+        if not (os.path.isfile(in_path) and os.path.isfile(gt_path)):
+            continue
 
-            if not os.path.isfile(gt_path):
-                continue
+        pairs.append(("DayRainDrop", in_path, gt_path))
+        count += 1
 
-            pairs.append(("DayRainDrop", in_path, gt_path))
-            total_count += 1
-
-    print(f"[DayRainDrop] Found {total_count} pairs.")
+    print(f"[DayRainDrop] Found {count} pairs.")
     return pairs
-
 
 # ------------------------------------------------------------------
 # 2) NightRainDrop (Drop/00001/00001.png ↔ Clear/00001/00001.png, 첫 프레임만)
