@@ -311,28 +311,42 @@ from datasets.multitask_dataset_cache import MultiTaskDatasetCache
 from models.backbone.vetnet_backbone import VETNetBackbone
 from torch.amp import autocast, GradScaler
 
+# skimage (PSNR/SSIM용)
 try:
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
     USE_SKIMAGE = True
 except:
     USE_SKIMAGE = False
 
+# MS-SSIM (구조 보존용)
+try:
+    from pytorch_msssim import ms_ssim
+    USE_MSSSIM = True
+    print("[Loss] Using MS-SSIM from pytorch_msssim.")
+except:
+    USE_MSSSIM = False
+    print("[Loss WARNING] pytorch_msssim not found. "
+          "MS-SSIM term will be disabled. Install with: pip install pytorch-msssim")
 
+
+# ============================================================
+# Config
 # ============================================================
 class Config:
     cache_root = "G:/VETNet_pilot/preload_cache"
 
     save_root = "G:/VETNet_pilot/checkpoints/phase1_backbone"
     results_root = "G:/VETNet_pilot/results/phase1_backbone"
+    iter_preview_root = "G:/VETNet_pilot/results/phase1_backbone/iter_preview"   # [NEW]
 
     epochs = 100
     batch_size = 2
-    num_workers = 0     # PNG 캐시에서는 0이 가장 빠름
+    num_workers = 0
     lr = 3e-4
 
     in_channels = 3
     out_channels = 3
-    dim = 32
+    dim = 64
     num_blocks = (4, 6, 6, 8)
     heads = (1, 2, 4, 8)
     volterra_rank = 4
@@ -342,13 +356,30 @@ class Config:
     metric_images_per_batch = 2
     use_amp = True
 
-    # 🔵 새로 추가: 미리보기로 저장할 이미지 수
-    preview_count = 3
+    # epoch 내 iteration preview 확률
+    iter_preview_prob = 0.0015     # 평균 1~2장 저장됨 (9577 iter 기준)
+    iter_preview_count = 1         # 1 iteration 당 1장만 저장
 
 
 cfg = Config()
 
 
+# ============================================================
+# Charbonnier Loss
+# ============================================================
+class CharbonnierLoss(torch.nn.Module):
+    def __init__(self, eps=1e-3):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, pred, gt):
+        diff = pred - gt
+        loss = torch.sqrt(diff * diff + self.eps * self.eps)
+        return loss.mean()
+
+
+# ============================================================
+# Helper
 # ============================================================
 def tensor_to_img(t):
     t = t.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
@@ -370,21 +401,6 @@ def save_triplet(input, pred, gt, path):
     Image.fromarray(canvas).save(path)
 
 
-# 🔵 랜덤 미리보기 저장 기능
-def save_preview_images(inputs, preds, gts, epoch, save_dir, count=3):
-    os.makedirs(save_dir, exist_ok=True)
-
-    total = inputs.size(0)
-    count = min(count, total)
-
-    # 랜덤 선택
-    idxs = np.random.choice(total, count, replace=False)
-
-    for i, idx in enumerate(idxs):
-        path = os.path.join(save_dir, f"epoch_{epoch:03d}_preview_{i:02d}.png")
-        save_triplet(inputs[idx], preds[idx], gts[idx], path)
-
-
 def compute_psnr_ssim(pred, gt):
     if not USE_SKIMAGE:
         return 0, 0
@@ -396,28 +412,30 @@ def compute_psnr_ssim(pred, gt):
 
 
 # ============================================================
+# Training Loop
+# ============================================================
 def train_phase1():
 
     os.makedirs(cfg.save_root, exist_ok=True)
     os.makedirs(cfg.results_root, exist_ok=True)
+    os.makedirs(cfg.iter_preview_root, exist_ok=True)   # [NEW]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[Device]", device)
 
-    # ============================================================
     dataset = MultiTaskDatasetCache(cfg.cache_root, size=256)
     loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=cfg.num_workers,
         pin_memory=True,
         drop_last=True,
     )
 
     print("[Data] Total cached samples =", len(dataset))
 
-    # ------------------------------------------------------------
+    # ---------------- Model ----------------
     model = VETNetBackbone(
         in_channels=cfg.in_channels,
         out_channels=cfg.out_channels,
@@ -433,7 +451,9 @@ def train_phase1():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=cfg.use_amp)
+
+    charb_loss = CharbonnierLoss().to(device)
 
     best_ssim = -1
 
@@ -441,43 +461,37 @@ def train_phase1():
     for epoch in range(1, cfg.epochs + 1):
 
         model.train()
-        loss_sum = 0
-        psnr_sum = 0
-        ssim_sum = 0
+        loss_sum = psnr_sum = ssim_sum = 0.0
         cnt = 0
 
         pbar = tqdm(loader, ncols=120, desc=f"Epoch {epoch}")
 
-        # 🔵 미리보기 저장용 임시 버퍼
-        preview_inp = None
-        preview_gt = None
-        preview_pred = None
-
-        for batch in pbar:
+        for it, batch in enumerate(pbar):
             inp = batch["input"].to(device)
             gt = batch["gt"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
+            # Forward
             with autocast(device_type="cuda", dtype=torch.float16, enabled=cfg.use_amp):
                 pred = model(inp)
-                loss = F.l1_loss(pred, gt)
+                pred_c = pred.clamp(0, 1)
+
+                l1 = F.l1_loss(pred_c, gt)
+                lc = charb_loss(pred_c, gt)
+
+                if USE_MSSSIM:
+                    lssim = 1.0 - ms_ssim(pred_c, gt, data_range=1.0)
+                    loss = 0.4 * lc + 0.4 * l1 + 0.2 * lssim
+                else:
+                    loss = 0.5 * lc + 0.5 * l1
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            pred_c = pred.clamp(0, 1)
-
-            # 🔵 미리보기용 첫 배치를 저장
-            if preview_inp is None:
-                preview_inp = inp.detach().cpu()
-                preview_gt = gt.detach().cpu()
-                preview_pred = pred_c.detach().cpu()
-
-            # 평가
+            # Metrics
             ps, ss = compute_psnr_ssim(pred_c, gt)
-
             loss_sum += loss.item()
             psnr_sum += ps
             ssim_sum += ss
@@ -489,6 +503,26 @@ def train_phase1():
                 "S": f"{ssim_sum/cnt:.3f}",
             })
 
+            # ============================================================
+            # 🔵 [NEW] ITERATION 중 랜덤 PREVIEW 저장
+            # ============================================================
+            if np.random.rand() < cfg.iter_preview_prob:
+                save_path = os.path.join(
+                    cfg.iter_preview_root,
+                    f"epoch{epoch:03d}_iter{it:05d}.png"
+                )
+                save_triplet(
+                    inp[0].detach().cpu(),
+                    pred_c[0].detach().cpu(),
+                    gt[0].detach().cpu(),
+                    save_path
+                )
+                # 속도 영향 최소화를 위해 1장만 저장
+                # (iter_preview_count 옵션 활용 가능)
+
+        # ============================================================
+        # Epoch 종료 후 스케줄러 업데이트
+        # ============================================================
         epoch_loss = loss_sum / cnt
         epoch_psnr = psnr_sum / cnt
         epoch_ssim = ssim_sum / cnt
@@ -497,25 +531,10 @@ def train_phase1():
 
         print(f"\n[Epoch {epoch}] Loss={epoch_loss:.4f}  PSNR={epoch_psnr:.2f}  SSIM={epoch_ssim:.4f}")
 
-        # ======================================================
-        # 🔵 랜덤 Preview 이미지 저장
-        # ======================================================
-        save_preview_images(preview_inp, preview_pred, preview_gt,
-                            epoch, cfg.results_root, count=cfg.preview_count)
-
-        # ======================================================
-        # 원래 epoch 이미지 저장 (첫 1장)
-        img_path = os.path.join(
-            cfg.results_root,
-            f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.4f}.png",
-        )
-        save_triplet(preview_inp[0], preview_pred[0], preview_gt[0], img_path)
-
-        # ======================================================
-        # checkpoint 저장
-        ckpt_path = os.path.join(
+        # ---------------- Checkpoint 저장 ----------------
+        ckpt = os.path.join(
             cfg.save_root,
-            f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.4f}.pth",
+            f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.4f}.pth"
         )
         torch.save(
             {
@@ -524,9 +543,10 @@ def train_phase1():
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
             },
-            ckpt_path,
+            ckpt,
         )
 
+        # 베스트 모델 저장
         if epoch_ssim > best_ssim:
             best_ssim = epoch_ssim
             torch.save(model.state_dict(), os.path.join(cfg.save_root, "best_phase1_backbone.pth"))
