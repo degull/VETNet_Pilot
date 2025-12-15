@@ -1,4 +1,5 @@
-# G:/VETNet_pilot/models/backbone/vetnet_backbone.py
+""" # G:/VETNet_pilot/models/backbone/vetnet_backbone.py
+# phase -1 (vetnet backbone)
 import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -68,11 +69,6 @@ class DecoderStage(nn.Module):
 
 
 class VETNetBackbone(nn.Module):
-    """
-    Phase1용 VETNet Backbone (Restormer + Volterra 기반 U-Net)
-    - 입력: (B, 3, H, W)
-    - 출력: (B, 3, H, W)
-    """
     def __init__(
         self,
         in_channels=3,
@@ -162,19 +158,12 @@ class VETNetBackbone(nn.Module):
 
     @staticmethod
     def _pad_and_add(up_tensor, skip_tensor):
-        """
-        업샘플된 텐서와 skip 연결 텐서의 spatial size가 다를 경우
-        bilinear interpolate로 맞추고 더해줌.
-        """
         if up_tensor.shape[-2:] != skip_tensor.shape[-2:]:
             up_tensor = F.interpolate(up_tensor, size=skip_tensor.shape[-2:],
                                       mode="bilinear", align_corners=False)
         return up_tensor + skip_tensor
 
     def forward(self, x):
-        """
-        x: (B, 3, H, W)
-        """
         x_embed = self.patch_embed(x)
 
         # Encoder
@@ -210,3 +199,158 @@ if __name__ == "__main__":
     print(f"Output Shape: {y.shape}")
     assert y.shape == x.shape, "입력과 출력 해상도가 일치해야 합니다!"
     print(">> VETNetBackbone Phase1: OK (입력/출력 shape 일치)")
+
+ """
+# phase -2 (control bridge)
+# G:/VETNet_pilot/models/backbone/vetnet_backbone.py
+import os, sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from models.backbone.blocks import VETBlock
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.body = nn.Conv2d(in_channels, in_channels * 2, 3, 2, 1)
+
+    def forward(self, x):
+        return self.body(x)
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * 4, 1),
+            nn.PixelShuffle(2),
+        )
+
+    def forward(self, x):
+        return self.body(x)
+
+
+class EncoderStage(nn.Module):
+    def __init__(self, dim, depth, num_heads, volterra_rank, ffn_expansion_factor, bias=False):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            VETBlock(
+                dim=dim,
+                num_heads=num_heads,
+                volterra_rank=volterra_rank,
+                ffn_expansion_factor=ffn_expansion_factor,
+                bias=bias,
+            )
+            for _ in range(depth)
+        ])
+
+    def forward(self, x, strategy_tokens=None):
+        for blk in self.blocks:
+            x = blk(x, strategy_tokens=strategy_tokens)
+        return x
+
+
+class DecoderStage(EncoderStage):
+    pass
+
+
+class VETNetBackbone(nn.Module):
+    """
+    Phase-2 대응 VETNet Backbone
+    """
+
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=3,
+        dim=64,
+        num_blocks=(4, 6, 6, 8),
+        heads=(1, 2, 4, 8),
+        volterra_rank=4,
+        ffn_expansion_factor=2.66,
+        bias=False,
+    ):
+        super().__init__()
+
+        self.patch_embed = nn.Conv2d(in_channels, dim, 3, 1, 1)
+
+        # Encoder
+        self.encoder1 = EncoderStage(dim,     num_blocks[0], heads[0], volterra_rank, ffn_expansion_factor, bias)
+        self.down1    = Downsample(dim)
+
+        self.encoder2 = EncoderStage(dim * 2, num_blocks[1], heads[1], volterra_rank, ffn_expansion_factor, bias)
+        self.down2    = Downsample(dim * 2)
+
+        self.encoder3 = EncoderStage(dim * 4, num_blocks[2], heads[2], volterra_rank, ffn_expansion_factor, bias)
+        self.down3    = Downsample(dim * 4)
+
+        self.latent   = EncoderStage(dim * 8, num_blocks[3], heads[3], volterra_rank, ffn_expansion_factor, bias)
+
+        # Decoder
+        self.up3 = Upsample(dim * 8, dim * 4)
+        self.decoder3 = DecoderStage(dim * 4, num_blocks[2], heads[2], volterra_rank, ffn_expansion_factor, bias)
+
+        self.up2 = Upsample(dim * 4, dim * 2)
+        self.decoder2 = DecoderStage(dim * 2, num_blocks[1], heads[1], volterra_rank, ffn_expansion_factor, bias)
+
+        self.up1 = Upsample(dim * 2, dim)
+        self.decoder1 = DecoderStage(dim, num_blocks[0], heads[0], volterra_rank, ffn_expansion_factor, bias)
+
+        self.refinement = EncoderStage(dim, num_blocks[0], heads[0], volterra_rank, ffn_expansion_factor, bias)
+        self.output = nn.Conv2d(dim, out_channels, 3, 1, 1)
+
+    def _add(self, x, skip):
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return x + skip
+
+    def forward(self, x, strategy_tokens=None):
+        """
+        strategy_tokens: dict {stage1, stage2, stage3, stage4}
+        """
+        strategy_tokens = strategy_tokens or {}
+
+        x = self.patch_embed(x)
+
+        e1 = self.encoder1(x, strategy_tokens.get("stage1"))
+        e2 = self.encoder2(self.down1(e1), strategy_tokens.get("stage2"))
+        e3 = self.encoder3(self.down2(e2), strategy_tokens.get("stage3"))
+        b  = self.latent(self.down3(e3), strategy_tokens.get("stage4"))
+
+        d3 = self.decoder3(self._add(self.up3(b), e3), strategy_tokens.get("stage3"))
+        d2 = self.decoder2(self._add(self.up2(d3), e2), strategy_tokens.get("stage2"))
+        d1 = self.decoder1(self._add(self.up1(d2), e1), strategy_tokens.get("stage1"))
+
+        r = self.refinement(d1, strategy_tokens.get("stage1"))
+        return self.output(r + x)
+
+
+# =========================================================
+# Self-test
+# =========================================================
+if __name__ == "__main__":
+    print("\n[vetnet_backbone.py] Phase-2 Self-test")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VETNetBackbone().to(device).eval()
+
+    B, H, W = 2, 128, 128
+    x = torch.randn(B, 3, H, W, device=device)
+
+    strategy_tokens = {
+        "stage1": torch.randn(B, 4, 64, device=device),
+        "stage2": torch.randn(B, 4, 128, device=device),
+        "stage3": torch.randn(B, 4, 256, device=device),
+        "stage4": torch.randn(B, 4, 512, device=device),
+    }
+
+    with torch.no_grad():
+        y = model(x, strategy_tokens=strategy_tokens)
+
+    print("Input :", x.shape)
+    print("Output:", y.shape)
+    print("[vetnet_backbone.py] Phase-2 Self-test 완료\n")
