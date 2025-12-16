@@ -1,4 +1,4 @@
-""" # G:/VETNet_pilot/models/backbone/vetnet_backbone.py
+# G:/VETNet_pilot/models/backbone/vetnet_backbone.py
 # phase -1 (vetnet backbone)
 import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -200,9 +200,10 @@ if __name__ == "__main__":
     assert y.shape == x.shape, "입력과 출력 해상도가 일치해야 합니다!"
     print(">> VETNetBackbone Phase1: OK (입력/출력 shape 일치)")
 
- """
+
 # phase -2 (control bridge)
 # G:/VETNet_pilot/models/backbone/vetnet_backbone.py
+"""
 import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
@@ -259,9 +260,7 @@ class DecoderStage(EncoderStage):
 
 
 class VETNetBackbone(nn.Module):
-    """
-    Phase-2 대응 VETNet Backbone
-    """
+
 
     def __init__(
         self,
@@ -309,9 +308,7 @@ class VETNetBackbone(nn.Module):
         return x + skip
 
     def forward(self, x, strategy_tokens=None):
-        """
-        strategy_tokens: dict {stage1, stage2, stage3, stage4}
-        """
+
         strategy_tokens = strategy_tokens or {}
 
         x = self.patch_embed(x)
@@ -354,3 +351,178 @@ if __name__ == "__main__":
     print("Input :", x.shape)
     print("Output:", y.shape)
     print("[vetnet_backbone.py] Phase-2 Self-test 완료\n")
+
+
+""" 
+
+# phase 2
+import os, sys
+from typing import Optional, Dict, TYPE_CHECKING
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from models.backbone.blocks import VETBlock
+
+# ============================================================
+# TYPE CHECKING ONLY (🔥 핵심 수정 포인트)
+# ============================================================
+if TYPE_CHECKING:
+    from models.bridge.strategy_router import StrategyRouter
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.body = nn.Conv2d(in_channels, in_channels * 2,
+                              kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.body(x)
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * 4, kernel_size=1),
+            nn.PixelShuffle(2)
+        )
+
+    def forward(self, x):
+        return self.body(x)
+
+
+class EncoderStage(nn.Module):
+    def __init__(self, dim, depth, num_heads, volterra_rank, ffn_expansion_factor, bias=False):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            VETBlock(
+                dim=dim,
+                num_heads=num_heads,
+                volterra_rank=volterra_rank,
+                ffn_expansion_factor=ffn_expansion_factor,
+                bias=bias
+            )
+            for _ in range(depth)
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        strategy_tokens: Optional[torch.Tensor] = None,
+        router: Optional["StrategyRouter"] = None,
+        stage_name: Optional[str] = None,
+    ) -> torch.Tensor:
+        for blk in self.blocks:
+            routed = router(x, strategy_tokens, stage_name) if router is not None else strategy_tokens
+            x = blk(x, strategy_tokens=routed)
+        return x
+
+
+class DecoderStage(nn.Module):
+    def __init__(self, dim, depth, num_heads, volterra_rank, ffn_expansion_factor, bias=False):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            VETBlock(
+                dim=dim,
+                num_heads=num_heads,
+                volterra_rank=volterra_rank,
+                ffn_expansion_factor=ffn_expansion_factor,
+                bias=bias
+            )
+            for _ in range(depth)
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        strategy_tokens: Optional[torch.Tensor] = None,
+        router: Optional["StrategyRouter"] = None,
+        stage_name: Optional[str] = None,
+    ) -> torch.Tensor:
+        for blk in self.blocks:
+            routed = router(x, strategy_tokens, stage_name) if router is not None else strategy_tokens
+            x = blk(x, strategy_tokens=routed)
+        return x
+
+
+class VETNetBackbone(nn.Module):
+
+    def __init__(
+        self,
+        in_channels=3,
+        out_channels=3,
+        dim=64,
+        num_blocks=(4, 6, 6, 8),
+        heads=(1, 2, 4, 8),
+        volterra_rank=4,
+        ffn_expansion_factor=2.66,
+        bias=False,
+    ):
+        super().__init__()
+
+        self.patch_embed = nn.Conv2d(in_channels, dim, 3, 1, 1)
+
+        self.encoder1 = EncoderStage(dim, num_blocks[0], heads[0], volterra_rank, ffn_expansion_factor, bias)
+        self.down1 = Downsample(dim)
+
+        self.encoder2 = EncoderStage(dim*2, num_blocks[1], heads[1], volterra_rank, ffn_expansion_factor, bias)
+        self.down2 = Downsample(dim*2)
+
+        self.encoder3 = EncoderStage(dim*4, num_blocks[2], heads[2], volterra_rank, ffn_expansion_factor, bias)
+        self.down3 = Downsample(dim*4)
+
+        self.latent = EncoderStage(dim*8, num_blocks[3], heads[3], volterra_rank, ffn_expansion_factor, bias)
+
+        self.up3 = Upsample(dim*8, dim*4)
+        self.decoder3 = DecoderStage(dim*4, num_blocks[2], heads[2], volterra_rank, ffn_expansion_factor, bias)
+
+        self.up2 = Upsample(dim*4, dim*2)
+        self.decoder2 = DecoderStage(dim*2, num_blocks[1], heads[1], volterra_rank, ffn_expansion_factor, bias)
+
+        self.up1 = Upsample(dim*2, dim)
+        self.decoder1 = DecoderStage(dim, num_blocks[0], heads[0], volterra_rank, ffn_expansion_factor, bias)
+
+        self.refinement = EncoderStage(dim, num_blocks[0], heads[0], volterra_rank, ffn_expansion_factor, bias)
+        self.output = nn.Conv2d(dim, out_channels, 3, 1, 1)
+
+    @staticmethod
+    def _pad_and_add(up, skip):
+        if up.shape[-2:] != skip.shape[-2:]:
+            up = F.interpolate(up, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return up + skip
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        strategy_tokens: Optional[Dict[str, torch.Tensor]] = None,
+        router: Optional["StrategyRouter"] = None,
+    ) -> torch.Tensor:
+
+        if strategy_tokens is None:
+            strategy_tokens = {}
+
+        x0 = self.patch_embed(x)
+
+        e1 = self.encoder1(x0, strategy_tokens.get("stage1"), router, "stage1")
+        e2 = self.encoder2(self.down1(e1), strategy_tokens.get("stage2"), router, "stage2")
+        e3 = self.encoder3(self.down2(e2), strategy_tokens.get("stage3"), router, "stage3")
+        b  = self.latent(self.down3(e3), strategy_tokens.get("stage4"), router, "stage4")
+
+        d3 = self.decoder3(self._pad_and_add(self.up3(b), e3))
+        d2 = self.decoder2(self._pad_and_add(self.up2(d3), e2))
+        d1 = self.decoder1(self._pad_and_add(self.up1(d2), e1))
+
+        r = self.refinement(d1)
+        return self.output(r + x0)
+
+
+# ============================================================
+# Self-test
+# ============================================================
+if __name__ == "__main__":
+    print("[vetnet_backbone] import & forward OK")

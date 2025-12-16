@@ -1,6 +1,6 @@
-# G:/VETNet_pilot/models/backbone/mdta_strategy.py
+""" # G:/VETNet_pilot/models/backbone/mdta_strategy.py
 # phase -1 (vetnet backbone)
-""" import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -112,23 +112,30 @@ if __name__ == "__main__":
 
 # G:/VETNet_pilot/models/backbone/mdta_strategy.py
 # phase -2 (control bridge)
+# G:/VETNet_pilot/models/backbone/mdta_strategy.py
+# Phase-1 MDTA (conv) + Phase-2 Strategy Steering (OOM-safe)
+from __future__ import annotations
+
 import os
 import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# -------------------------------------------------------------------------
+# ROOT (디버그 편의)
+# -------------------------------------------------------------------------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))           # .../models/backbone
+ROOT = os.path.dirname(os.path.dirname(CURRENT_DIR))               # .../VETNet_pilot
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 # ============================================================
 # Phase-1 MDTA (original: channel-wise transposed attention)
 # ============================================================
 class MDTA(nn.Module):
-    """
-    Multi-DConv Head Transposed Attention (channel-wise attention version)
-    - input : (B, C, H, W)
-    - attention computed in channel dimension (C_head x C_head) per head
-    """
-    def __init__(self, dim, num_heads=8, bias=False):
+
+    def __init__(self, dim: int, num_heads: int = 8, bias: bool = False):
         super().__init__()
         assert dim % num_heads == 0, f"[MDTA] dim({dim}) must be divisible by num_heads({num_heads})"
         self.dim = dim
@@ -138,10 +145,8 @@ class MDTA(nn.Module):
         self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
-    def forward(self, x):
-        """
-        x: (B, C, H, W)
-        """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
         B, C, H, W = x.shape
         N = H * W
         C_head = C // self.num_heads
@@ -168,92 +173,92 @@ class MDTA(nn.Module):
 
 
 # ============================================================
-# Phase-2 MDTAWithStrategy (token concat + MDTA attention)
+# Phase-2 MDTAWithStrategy v2 (OOM-safe steering)
 # ============================================================
 class MDTAWithStrategy(nn.Module):
-    """
-    Phase-2 Strategy Token injection MDTA (token-wise attention).
 
-    Required core logic:
-        X ∈ R^{B×N×C}
-        S ∈ R^{B×K×C}
-
-        X_in = concat([X, S], dim=1)      # (B, N+K, C)
-        Y = MDTA(X_in)
-        Y_img = Y[:, :N, :]              # keep only image tokens
-
-    Notes:
-    - This module is used after feature flattening (H*W -> N tokens).
-    - Strategy tokens "steer" attention but are not forwarded to next layers.
-    """
-    def __init__(self, dim, num_heads=8, bias=False):
+    def __init__(self, dim: int, num_heads: int = 8, bias: bool = False):
         super().__init__()
         assert dim % num_heads == 0, f"[MDTAWithStrategy] dim({dim}) must be divisible by num_heads({num_heads})"
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        # per-head temperature (broadcast to (B, H, N, N))
+        # temperature per head (broadcast to (B, H, N, K))
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=bias)
+        # Q from image, K/V from strategy
+        self.q_proj = nn.Linear(dim, dim, bias=bias)
+        self.k_proj = nn.Linear(dim, dim, bias=bias)
+        self.v_proj = nn.Linear(dim, dim, bias=bias)
+
         self.project_out = nn.Linear(dim, dim, bias=bias)
 
-    def forward(self, X_flat: torch.Tensor, S_tokens: torch.Tensor = None) -> torch.Tensor:
-        """
-        X_flat : (B, N, C) image tokens
-        S_tokens: (B, K, C) strategy tokens (optional)
+        # S가 None일 때 fallback (아무 steering 없이 identity-ish)
+        # - 계산을 완전히 생략하고 X_flat을 그대로 반환하면
+        #   "with/without S" 차이가 너무 극단적이라 디버깅에 애매할 수 있음.
+        # - 그래서 아주 가벼운 self-attn 대체(선택)도 가능하지만,
+        #   여기서는 안전/단순 위해 "그대로 반환"을 기본으로 둠.
+        self.return_identity_if_no_strategy = True
 
-        return : (B, N, C) image tokens only
-        """
+    def forward(self, X_flat: torch.Tensor, S_tokens: torch.Tensor | None = None) -> torch.Tensor:
+
         if X_flat.dim() != 3:
             raise ValueError(f"[MDTAWithStrategy] X_flat must be (B,N,C). Got: {tuple(X_flat.shape)}")
-
         B, N, C = X_flat.shape
         if C != self.dim:
             raise ValueError(f"[MDTAWithStrategy] X_flat C({C}) != self.dim({self.dim})")
 
-        # 1) concat strategy tokens (if provided)
-        if S_tokens is not None:
-            if S_tokens.dim() != 3:
-                raise ValueError(f"[MDTAWithStrategy] S_tokens must be (B,K,C). Got: {tuple(S_tokens.shape)}")
-            if S_tokens.size(0) != B or S_tokens.size(2) != C:
-                raise ValueError(
-                    f"[MDTAWithStrategy] S_tokens must be (B,K,C) with same B,C as X_flat. "
-                    f"X_flat={tuple(X_flat.shape)} S_tokens={tuple(S_tokens.shape)}"
-                )
-            X_in = torch.cat([X_flat, S_tokens], dim=1)  # (B, N+K, C)
-        else:
-            X_in = X_flat                                # (B, N, C)
+        # No strategy: return X as-is (safe, fast)
+        if S_tokens is None:
+            if self.return_identity_if_no_strategy:
+                return X_flat
+            else:
+                # (원하면 여기서 가벼운 변형을 넣을 수 있음)
+                return self.project_out(self.q_proj(X_flat))
 
-        N_tot = X_in.size(1)
+        if S_tokens.dim() != 3:
+            raise ValueError(f"[MDTAWithStrategy] S_tokens must be (B,K,C). Got: {tuple(S_tokens.shape)}")
+        if S_tokens.size(0) != B or S_tokens.size(2) != C:
+            raise ValueError(
+                f"[MDTAWithStrategy] S_tokens must be (B,K,C) with same B,C as X_flat. "
+                f"X_flat={tuple(X_flat.shape)} S_tokens={tuple(S_tokens.shape)}"
+            )
+        K = S_tokens.size(1)
+        if K == 0:
+            return X_flat
 
-        # 2) QKV
-        qkv = self.qkv(X_in)               # (B, N_tot, 3C)
-        q, k, v = qkv.chunk(3, dim=-1)     # each: (B, N_tot, C)
+        # 1) Q from image tokens
+        q = self.q_proj(X_flat)  # (B, N, C)
 
-        # 3) reshape to multi-head: (B, H, N_tot, d)
-        q = q.view(B, N_tot, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, N_tot, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, N_tot, self.num_heads, self.head_dim).transpose(1, 2)
+        # 2) K,V from strategy tokens (only K tokens!)
+        k = self.k_proj(S_tokens)  # (B, K, C)
+        v = self.v_proj(S_tokens)  # (B, K, C)
+
+        # 3) reshape to multi-head
+        # q: (B, H, N, d), k/v: (B, H, K, d)
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, K, self.num_heads, self.head_dim).transpose(1, 2)
 
         # 4) normalize (Restormer-style)
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
 
-        # 5) attention over tokens: (B, H, N_tot, N_tot)
+        # 5) cross-attn score: (B, H, N, K)  ✅ O(N*K)
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.temperature
         attn = attn.softmax(dim=-1)
 
-        # 6) apply attention: (B, H, N_tot, d)
+        # 6) apply: (B, H, N, d)
         out = torch.matmul(attn, v)
 
-        # 7) merge heads: (B, N_tot, C)
-        out = out.transpose(1, 2).contiguous().view(B, N_tot, C)
-        out = self.project_out(out)  # (B, N_tot, C)
+        # 7) merge heads: (B, N, C)
+        out = out.transpose(1, 2).contiguous().view(B, N, C)
+        out = self.project_out(out)
 
-        # 8) keep only image tokens
-        Y_img = out[:, :N, :]
+        # 8) residual-style steering (권장: 안정적)
+        # - strategy가 "조향"이므로, 본문 feature를 덮어쓰기보다 delta로 주는 게 보통 안정적
+        Y_img = X_flat + out
         return Y_img
 
 
@@ -262,6 +267,7 @@ class MDTAWithStrategy(nn.Module):
 # ============================================================
 if __name__ == "__main__":
     print("[mdta_strategy] Self-test 시작")
+    print("[mdta_strategy] ROOT =", ROOT)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[mdta_strategy] Device =", device)
@@ -277,9 +283,9 @@ if __name__ == "__main__":
     print("Output:", tuple(y.shape))
 
     # ---------------------------
-    # Test B: Phase-2 MDTAWithStrategy (token concat)
+    # Test B: Phase-2 MDTAWithStrategy v2 (small tokens)
     # ---------------------------
-    print("\n=== Test B: MDTAWithStrategy (Phase-2 token concat) ===")
+    print("\n=== Test B: MDTAWithStrategy v2 (N=1024, K=4) ===")
     B, N, C = 2, 1024, 64
     K = 4
     X_flat = torch.randn(B, N, C, device=device)
@@ -297,8 +303,30 @@ if __name__ == "__main__":
     print("Y(no S):", tuple(y_noS.shape))
     print("Y(with):", tuple(y_withS.shape))
 
-    # strategy가 실제로 영향을 주는지 간단 체크
     diff = (y_withS - y_noS).abs().mean().item()
     print(f"[mdta_strategy] mean(|Y_withS - Y_noS|) = {diff:.6f} (0이 아니면 steering 영향 있음)")
+
+    # ---------------------------
+    # Test C: Phase-2 MDTAWithStrategy v2 (large tokens: 256x256=65536)
+    #   - 기존 v1은 여기서 N^2로 바로 터짐
+    #   - v2는 N*K라서 보통 문제 없이 통과해야 함
+    # ---------------------------
+    print("\n=== Test C: MDTAWithStrategy v2 (N=65536, K=4) OOM-check ===")
+    try:
+        B, H, W, C = 1, 256, 256, 64
+        N = H * W
+        X_big = torch.randn(B, N, C, device=device)
+        S_big = torch.randn(B, 4, C, device=device)
+        with torch.no_grad():
+            Y_big = mdta_s(X_big, S_tokens=S_big)
+        print("X_big :", tuple(X_big.shape))
+        print("Y_big :", tuple(Y_big.shape))
+        print("[mdta_strategy] ✅ Large-token test passed (OOM 없이 통과)")
+    except torch.cuda.OutOfMemoryError as e:
+        print("[mdta_strategy] ❌ OOM 발생:", str(e))
+        print("→ 그래도 v1 대비 메모리 폭발 위험은 훨씬 낮음. "
+              "B/H/W/C를 줄이거나, AMP/grad-checkpoint를 고려.")
+    except Exception as e:
+        print("[mdta_strategy] ❌ 오류:", repr(e))
 
     print("\n[mdta_strategy] Self-test 완료")
