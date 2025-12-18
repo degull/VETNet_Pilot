@@ -283,23 +283,17 @@ if __name__ == "__main__":
     train_phase2(cfg)
  """
 
-# 100iteration당 저장
-# G:/VETNet_pilot/trainers/train_phase2_pilot.py
-
 import os
 import sys
 import json
-import time
 import random
 from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple
+from typing import List, Tuple, Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-
 from torchvision.utils import save_image
 
 # ------------------------------------------------------------
@@ -316,14 +310,16 @@ print(f"[train_phase2_pilot] ROOT = {ROOT}")
 # ------------------------------------------------------------
 from models.vllm_vetnet import VLLMVETNet, VLLMVETNetConfig
 
-# SSIM
+# ------------------------------------------------------------
+# SSIM (metric & optional loss)
+# ------------------------------------------------------------
 try:
     from pytorch_msssim import ssim as msssim_ssim
     _HAS_MSSSIM = True
-    print("[Loss] Using pytorch_msssim.ssim")
+    print("[Loss/Metric] Using pytorch_msssim.ssim")
 except Exception:
     _HAS_MSSSIM = False
-    print("[Loss] pytorch_msssim not found -> SSIM disabled")
+    print("[Loss/Metric] pytorch_msssim not found -> SSIM disabled")
 
 # ============================================================
 # Utils
@@ -338,6 +334,47 @@ def _safe_makedirs(p: str):
 
 def _to_01(x: torch.Tensor):
     return x.clamp(0.0, 1.0)
+
+@torch.no_grad()
+def compute_psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    # ✅ metrics는 FP32 강제
+    pred = _to_01(pred).float()
+    gt = _to_01(gt).float()
+    mse = (pred - gt).pow(2).mean(dim=(1, 2, 3))
+    psnr = 10.0 * torch.log10(1.0 / (mse + 1e-10))
+    return psnr.mean().item()
+
+@torch.no_grad()
+def compute_ssim(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    if not _HAS_MSSSIM:
+        return float("nan")
+    # ✅ SSIM은 FP32 강제 (AMP half 방지)
+    pred = _to_01(pred).float()
+    gt = _to_01(gt).float()
+    s = msssim_ssim(pred, gt, data_range=1.0, size_average=True)
+    return float(s.item())
+
+def _isnan(x: float) -> bool:
+    return x != x
+
+# ============================================================
+# EMA Helper
+# ============================================================
+class EMA:
+    def __init__(self, beta: float = 0.95):
+        self.beta = beta
+        self.v: Dict[str, float] = {}
+
+    def update(self, key: str, value: float):
+        if _isnan(value):
+            return
+        if key not in self.v:
+            self.v[key] = value
+        else:
+            self.v[key] = self.beta * self.v[key] + (1.0 - self.beta) * value
+
+    def get(self, key: str, default: float = float("nan")) -> float:
+        return self.v.get(key, default)
 
 # ============================================================
 # Dataset
@@ -378,22 +415,6 @@ class PreloadCacheDataset(Dataset):
             "gt_path": gt_path,
         }
 
-def build_pairs_from_preload_cache(root_dir: str):
-    pairs = []
-    for d in sorted(os.listdir(root_dir)):
-        dpath = os.path.join(root_dir, d)
-        if not os.path.isdir(dpath):
-            continue
-        ins = [f for f in os.listdir(dpath) if f.endswith("_in.png")]
-        for f in sorted(ins):
-            base = f.replace("_in.png", "")
-            inp = os.path.join(dpath, f)
-            gt = os.path.join(dpath, base + "_gt.png")
-            if os.path.isfile(gt):
-                pairs.append((inp, gt))
-        print(f"[DATA] {d}: {len(ins)} pairs")
-    return pairs
-
 # ============================================================
 # Config
 # ============================================================
@@ -403,22 +424,34 @@ class Phase2Config:
     device: str = "cuda"
     use_amp: bool = True
 
-    phase1_ckpt: str = r"G:\VETNet_pilot\checkpoints\phase1_backbone\epoch_089_L0.0085_P38.07_S0.9662.pth"
+    phase1_ckpt: str = r"G:\VETNet_pilot\checkpoints\phase1_backbone\epoch_060_L0.0116_P35.76_S0.9594.pth"
     out_dir: str = r"G:\VETNet_pilot\checkpoints\phase2_pilot"
 
     preload_cache_root: str = r"G:\VETNet_pilot\preload_cache"
     pairs_cache_json: str = r"G:\VETNet_pilot\data_cache\pairs_cache_phase2.json"
 
-    # 🔥 preview 저장 경로
     preview_dir: str = r"G:\VETNet_pilot\results\phase2_pilot\iter_preview"
     preview_interval: int = 100
+
+    # ✅ metrics 계산/갱신 주기
+    metric_interval: int = 20
+
+    # ✅ alpha warm-up: 0 -> alpha_max 까지 선형 증가
+    warmup_iters: int = 6000
+    alpha_min: float = 0.30
+    alpha_max: float = 0.70  # ⭐ 0.3~0.7 구간에 오래 머무르게
+
+    # ✅ strategy 폭주 방지: token 노름 클램프
+    token_norm_clip: float = 5.0
+
+    # ✅ modulation 폭주 방지: (모델 내부에서 사용될 수 있도록 전달 시도)
+    modulation_scale_clip: float = 2.0
 
     batch_size: int = 1
     num_workers: int = 4
     patch_size: int = 256
-    epochs: int = 10
+    epochs: int = 120
     lr: float = 1e-4
-    lambda_ssim: float = 0.0
 
     backbone_dim: int = 64
     backbone_num_blocks: Tuple[int, int, int, int] = (4, 6, 6, 8)
@@ -434,103 +467,246 @@ class Phase2Config:
     dataset_tag: str = "MultiPreload"
 
 # ============================================================
-# Loss
+# Strategy clamp (best-effort)
 # ============================================================
-class Phase2Loss(nn.Module):
-    def __init__(self, lambda_ssim: float):
-        super().__init__()
-        self.lambda_ssim = lambda_ssim
+def try_enable_strategy_clamp(model: nn.Module, token_norm_clip: float, modulation_scale_clip: float):
+    """
+    프로젝트 코드(VLLMVETNet / strategy_router / control_projection)에 따라
+    clamp 옵션 이름이 다를 수 있어 'best-effort'로 세팅한다.
+    (없어도 학습은 진행됨)
+    """
+    candidates = []
 
-    def forward(self, pred, gt):
-        pred = _to_01(pred)
-        gt = _to_01(gt)
-        l1 = (pred - gt).abs().mean()
-        if self.lambda_ssim > 0 and _HAS_MSSSIM:
-            s = msssim_ssim(pred, gt, data_range=1.0, size_average=True)
-            return l1 + self.lambda_ssim * (1 - s)
-        return l1
+    # 흔한 네이밍들
+    for attr in ["strategy_router", "router", "control_projection", "projection", "strategy_head"]:
+        if hasattr(model, attr):
+            candidates.append(getattr(model, attr))
+
+    # 모델 자신도 포함
+    candidates.append(model)
+
+    for m in candidates:
+        # token norm clip
+        for key in ["token_norm_clip", "strategy_token_norm_clip", "s_norm_clip", "clip_token_norm"]:
+            if hasattr(m, key):
+                try:
+                    setattr(m, key, float(token_norm_clip))
+                    print(f"[Clamp] set {m.__class__.__name__}.{key} = {token_norm_clip}")
+                    break
+                except Exception:
+                    pass
+
+        # modulation scale clip
+        for key in ["modulation_scale_clip", "mod_scale_clip", "gamma_beta_clip", "clip_modulation_scale"]:
+            if hasattr(m, key):
+                try:
+                    setattr(m, key, float(modulation_scale_clip))
+                    print(f"[Clamp] set {m.__class__.__name__}.{key} = {modulation_scale_clip}")
+                    break
+                except Exception:
+                    pass
 
 # ============================================================
 # Train
 # ============================================================
 def train_phase2(cfg: Phase2Config):
     set_seed(cfg.seed)
-    device = torch.device(cfg.device)
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
     _safe_makedirs(cfg.out_dir)
     _safe_makedirs(cfg.preview_dir)
+    _safe_makedirs(os.path.dirname(cfg.pairs_cache_json))
 
-    if os.path.isfile(cfg.pairs_cache_json):
-        with open(cfg.pairs_cache_json) as f:
-            pairs = [(d["inp"], d["gt"]) for d in json.load(f)]
-        print(f"[CACHE] Loaded pairs = {len(pairs)}")
-    else:
-        pairs = build_pairs_from_preload_cache(cfg.preload_cache_root)
-        with open(cfg.pairs_cache_json, "w") as f:
-            json.dump([{"inp": a, "gt": b} for a, b in pairs], f, indent=2)
+    if not os.path.isfile(cfg.pairs_cache_json):
+        raise FileNotFoundError(f"pairs_cache_json not found: {cfg.pairs_cache_json}")
+
+    with open(cfg.pairs_cache_json) as f:
+        pairs = [(d["inp"], d["gt"]) for d in json.load(f)]
+    print(f"[CACHE] Loaded pairs = {len(pairs)}")
 
     dataset = PreloadCacheDataset(pairs, cfg.patch_size)
-    loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True,
-                        num_workers=cfg.num_workers, drop_last=True)
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        drop_last=True,
+        pin_memory=True,
+    )
 
-    model = VLLMVETNet(VLLMVETNetConfig(
-        backbone_dim=cfg.backbone_dim,
-        backbone_num_blocks=cfg.backbone_num_blocks,
-        backbone_heads=cfg.backbone_heads,
-        backbone_volterra_rank=cfg.backbone_volterra_rank,
-        stage_dims=cfg.stage_dims,
-        strategy_dim=cfg.strategy_dim,
-        num_tokens=cfg.num_tokens,
-        enable_llm=cfg.enable_llm,
-        enabled_stages=cfg.enabled_stages,
-    )).to(device)
+    model = VLLMVETNet(
+        VLLMVETNetConfig(
+            backbone_dim=cfg.backbone_dim,
+            backbone_num_blocks=cfg.backbone_num_blocks,
+            backbone_heads=cfg.backbone_heads,
+            backbone_volterra_rank=cfg.backbone_volterra_rank,
+            stage_dims=cfg.stage_dims,
+            strategy_dim=cfg.strategy_dim,
+            num_tokens=cfg.num_tokens,
+            enable_llm=cfg.enable_llm,
+            enabled_stages=cfg.enabled_stages,
+        )
+    ).to(device)
 
     model.load_phase1_backbone(cfg.phase1_ckpt)
     model.freeze_backbone()
 
-    opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=cfg.lr
-    )
+    # ✅ clamp 옵션 시도(모델이 지원하면 적용)
+    try_enable_strategy_clamp(model, cfg.token_norm_clip, cfg.modulation_scale_clip)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(f"[Trainable Params] {sum(p.numel() for p in trainable)/1e6:.3f} M")
+
+    opt = torch.optim.AdamW(trainable, lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)
-    criterion = Phase2Loss(cfg.lambda_ssim)
+
+    ema = EMA(beta=0.95)
+
+    # 마지막 측정값(출력용)
+    last = {
+        "PSNR_ON": float("nan"),
+        "SSIM_ON": float("nan"),
+        "PSNR_OFF": float("nan"),
+        "SSIM_OFF": float("nan"),
+        "dPSNR": float("nan"),
+        "dSSIM": float("nan"),
+        "alpha": 0.0
+    }
 
     global_iter = 0
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         pbar = tqdm(loader, desc=f"[Epoch {epoch}/{cfg.epochs}]")
+
         for batch in pbar:
             global_iter += 1
-            inp = batch["inp"].to(device)
-            gt = batch["gt"].to(device)
+
+            # ✅ 동일 batch, 동일 crop 보장: dataset에서 crop 완료된 텐서가 넘어옴
+            inp = batch["inp"].to(device, non_blocking=True)
+            gt  = batch["gt"].to(device, non_blocking=True)
+
+            # ✅ alpha 스케줄: 0->alpha_max 선형, 이후 alpha_min~alpha_max 구간 유지
+            ramp = min(1.0, global_iter / max(1, cfg.warmup_iters))
+            alpha = cfg.alpha_min + (cfg.alpha_max - cfg.alpha_min) * ramp
+            alpha = float(max(cfg.alpha_min, min(cfg.alpha_max, alpha)))
 
             opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=cfg.use_amp):
-                pred, _ = model(img_hr=inp, use_strategy=True, dataset_tag=cfg.dataset_tag)
-                loss = criterion(pred, gt)
+
+            # ----------------------------
+            # OFF (no grad) - baseline
+            # ----------------------------
+            with torch.no_grad():
+                with torch.amp.autocast(device_type="cuda", enabled=cfg.use_amp):
+                    pred_off_ng, _ = model(
+                        img_hr=inp,
+                        use_strategy=False,
+                        dataset_tag=cfg.dataset_tag,
+                    )
+
+            # ----------------------------
+            # ON (grad) + BLEND
+            # ----------------------------
+            with torch.amp.autocast(device_type="cuda", enabled=cfg.use_amp):
+                pred_on, _ = model(
+                    img_hr=inp,
+                    use_strategy=True,
+                    dataset_tag=cfg.dataset_tag,
+                )
+
+                # ✅ 안정화: ON이 OFF를 망가뜨리지 않게 blend
+                pred_blend = pred_off_ng + alpha * (pred_on - pred_off_ng)
+
+                # ✅ loss는 학습 출력(pred_blend) 기준
+                loss = (pred_blend - gt).abs().mean()
 
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
 
-            # 🔥 100 iter마다 preview 저장
+            # ----------------------------
+            # METRICS (주기적으로만 계산)
+            # ----------------------------
+            if global_iter % cfg.metric_interval == 0:
+                model.eval()
+                with torch.no_grad():
+                    # ✅ 같은 batch로 ON/OFF 각각 재추론 (동일 inp)
+                    with torch.amp.autocast(device_type="cuda", enabled=cfg.use_amp):
+                        pred_on_m, _ = model(img_hr=inp, use_strategy=True, dataset_tag=cfg.dataset_tag)
+                        pred_off_m, _ = model(img_hr=inp, use_strategy=False, dataset_tag=cfg.dataset_tag)
+
+                    psnr_on  = compute_psnr(pred_on_m, gt)
+                    psnr_off = compute_psnr(pred_off_m, gt)
+                    ssim_on  = compute_ssim(pred_on_m, gt)
+                    ssim_off = compute_ssim(pred_off_m, gt)
+
+                    dpsnr = psnr_on - psnr_off
+                    dssim = ssim_on - ssim_off
+
+                # EMA 업데이트
+                ema.update("PSNR_ON", psnr_on)
+                ema.update("PSNR_OFF", psnr_off)
+                ema.update("SSIM_ON", ssim_on)
+                ema.update("SSIM_OFF", ssim_off)
+                ema.update("dPSNR", dpsnr)
+                ema.update("dSSIM", dssim)
+
+                last.update({
+                    "PSNR_ON": psnr_on,
+                    "PSNR_OFF": psnr_off,
+                    "SSIM_ON": ssim_on,
+                    "SSIM_OFF": ssim_off,
+                    "dPSNR": dpsnr,
+                    "dSSIM": dssim,
+                    "alpha": alpha
+                })
+
+                model.train()
+
+            # ✅ 항상 출력: EMA를 기본으로 보여주고(안정적), last는 디버깅용으로 값 유지
+            psnr_on_ema  = ema.get("PSNR_ON")
+            psnr_off_ema = ema.get("PSNR_OFF")
+            ssim_on_ema  = ema.get("SSIM_ON")
+            ssim_off_ema = ema.get("SSIM_OFF")
+            dpsnr_ema    = ema.get("dPSNR")
+            dssim_ema    = ema.get("dSSIM")
+
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "PSNR_ON(EMA)":  f"{psnr_on_ema:.2f}"  if not _isnan(psnr_on_ema)  else "NA",
+                "SSIM_ON(EMA)":  f"{ssim_on_ema:.4f}"  if not _isnan(ssim_on_ema)  else "NA",
+                "PSNR_OFF(EMA)": f"{psnr_off_ema:.2f}" if not _isnan(psnr_off_ema) else "NA",
+                "SSIM_OFF(EMA)": f"{ssim_off_ema:.4f}" if not _isnan(ssim_off_ema) else "NA",
+                "dPSNR(EMA)":    f"{dpsnr_ema:.2f}"    if not _isnan(dpsnr_ema)    else "NA",
+                "dSSIM(EMA)":    f"{dssim_ema:.4f}"    if not _isnan(dssim_ema)    else "NA",
+                "alpha": f"{alpha:.3f}",
+            })
+
+            # ----------------------------
+            # PREVIEW (blend 저장: 실제 학습 출력과 동일)
+            # ----------------------------
             if global_iter % cfg.preview_interval == 0:
-                name = os.path.basename(batch["inp_path"][0]).replace("_in.png", "")
-                out_img = torch.cat([inp, pred, gt], dim=3)
-                save_path = os.path.join(
-                    cfg.preview_dir,
-                    f"ep{epoch:02d}_it{global_iter:06d}_{name}.png"
-                )
-                save_image(out_img, save_path)
-                print(f"[Preview] saved -> {save_path}")
+                with torch.no_grad():
+                    model.eval()
+                    with torch.amp.autocast(device_type="cuda", enabled=cfg.use_amp):
+                        pred_off_v, _ = model(img_hr=inp, use_strategy=False, dataset_tag=cfg.dataset_tag)
+                        pred_on_v, _ = model(img_hr=inp, use_strategy=True, dataset_tag=cfg.dataset_tag)
+                        pred_blend_v = pred_off_v + alpha * (pred_on_v - pred_off_v)
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    name = os.path.basename(batch["inp_path"][0]).replace("_in.png", "")
+                    out_img = torch.cat([inp, pred_blend_v, gt], dim=3)
+                    save_path = os.path.join(
+                        cfg.preview_dir,
+                        f"ep{epoch:02d}_it{global_iter:06d}_{name}_a{alpha:.3f}.png"
+                    )
+                    save_image(out_img, save_path)
+                    print(f"[Preview] saved -> {save_path}")
+                    model.train()
 
-        torch.save(
-            {"epoch": epoch, "model": model.state_dict()},
-            os.path.join(cfg.out_dir, f"phase2_epoch_{epoch:03d}.pth")
-        )
+        ckpt_path = os.path.join(cfg.out_dir, f"phase2_epoch_{epoch:03d}.pth")
+        torch.save({"epoch": epoch, "model": model.state_dict()}, ckpt_path)
+        print(f"[Saved] {ckpt_path}")
 
 # ============================================================
 # Main
