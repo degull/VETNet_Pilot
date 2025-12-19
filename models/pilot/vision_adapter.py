@@ -1,4 +1,4 @@
-# G:/VETNet_pilot/models/pilot/vision_adapter.py
+""" # G:/VETNet_pilot/models/pilot/vision_adapter.py
 # CLIP 비전 임베딩 → LLM 입력 토큰
 import torch
 import torch.nn as nn
@@ -6,19 +6,6 @@ from typing import Tuple, Optional
 
 
 class VisionAdapter(nn.Module):
-    """
-    CLIP 등 Vision Encoder에서 나온 embedding을
-    LLM hidden space로 투영해서 'Strategy Prefix Tokens'로 만드는 모듈.
-
-    입력:
-        - vision_emb: Tensor, shape (B, Dv) 또는 (B, Nv, Dv)
-          * (B, Dv): CLS 토큰이나 pooled feature 1개
-          * (B, Nv, Dv): 패치/토큰 시퀀스
-
-    출력:
-        - strategy_tokens: (B, K, H)   # K: num_tokens, H: llm_hidden_dim
-        - pooled_feat:     (B, H)      # 요약된 1개 벡터 (선택적, 이후에 쓸 수 있음)
-    """
 
     def __init__(
         self,
@@ -51,16 +38,6 @@ class VisionAdapter(nn.Module):
         self.token_proj = nn.Linear(llm_hidden_dim, num_tokens * llm_hidden_dim)
 
     def forward(self, vision_emb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            vision_emb:
-                - (B, Dv)  또는
-                - (B, Nv, Dv)
-
-        Returns:
-            strategy_tokens: (B, K, H)
-            pooled_hidden:   (B, H)
-        """
 
         if vision_emb.dim() == 3:
             # (B, Nv, Dv) → mean pooling → (B, Dv)
@@ -129,3 +106,73 @@ if __name__ == "__main__":
     print("          pooled_hidden  :", pooled2.shape)  # (B, H)
 
     print("\n[vision_adapter] Self-test 완료.\n")
+ """
+
+# ver2
+# G:\VETNet_pilot\models\pilot\vision_adapter.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from transformers import CLIPModel, CLIPProcessor
+
+
+class CLIPVisionAdapter(nn.Module):
+    """
+    Frozen CLIP vision encoder that outputs a compact visual embedding.
+    - Uses CLIPModel (vision + text) but we only use vision.
+    - Returns pooled embedding (B, d_v) and optionally patch tokens.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "openai/clip-vit-large-patch14",
+        device: str = "cuda",
+        use_fp16: bool = False,
+    ):
+        super().__init__()
+        self.model_name = model_name
+        self.device = torch.device(device)
+
+        self.clip = CLIPModel.from_pretrained(model_name)
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+
+        self.clip.eval()
+        for p in self.clip.parameters():
+            p.requires_grad = False
+
+        self.clip.to(self.device)
+        self.use_fp16 = use_fp16
+
+    @torch.no_grad()
+    def forward(self, images: torch.Tensor):
+        """
+        images: (B,3,H,W) float tensor in [0,1]
+        returns:
+          pooled: (B, D)
+          patch_tokens: (B, N, D) or None (depending on CLIP internals)
+        """
+        # CLIPProcessor expects PIL images or numpy, but it can also accept torch tensors
+        # if we convert to list of PIL; however that's slow.
+        # We'll normalize manually like CLIP expects using CLIP vision_model's config.
+        # CLIP expects pixel_values normalized like processor does.
+        # We'll reuse processor for normalization by converting to CPU and back only if needed.
+        # To keep it simple and robust, use processor on CPU with minimal overhead for small batches.
+
+        # NOTE: If you want pure-tensor pipeline, replace this with CLIP image normalization.
+        imgs = images.detach().cpu()
+        inputs = self.processor(images=imgs, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(self.device)
+
+        if self.use_fp16:
+            pixel_values = pixel_values.half()
+
+        vision_outputs = self.clip.vision_model(pixel_values=pixel_values, output_hidden_states=True)
+        # last_hidden_state: (B, N, D)
+        patch_tokens = vision_outputs.last_hidden_state
+        pooled = patch_tokens[:, 0]  # CLS token
+
+        # L2 normalize (often beneficial)
+        pooled = F.normalize(pooled, dim=-1)
+
+        return pooled, patch_tokens

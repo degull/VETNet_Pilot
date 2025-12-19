@@ -1,4 +1,4 @@
-# G:/VETNet_pilot/models/pilot/tokenizer_utils.py
+""" # G:/VETNet_pilot/models/pilot/tokenizer_utils.py
 # Phase-2 LLM이 사용할 프롬프트 템플릿 생성기
 # dataset_tag, scene_tag, degradation_type 등을 받아서
 # LLM에 맞는 자연스러운 “Strategy Prompt” 문장을 만들어서 반환
@@ -50,17 +50,6 @@ def build_strategy_prompt(
     dataset_tag: Optional[str] = None,
     extra_info: Optional[Dict] = None
 ):
-    """
-    Phase2에서 LLM 입력으로 사용되는 strategy prompt 문자열 생성.
-
-    Args:
-        scene_desc : CLIP으로 분석해 얻은 이미지 장면 설명(optional)
-        dataset_tag : Rain100H / Raindrop / CSD 등
-        extra_info : 선택적 dict (e.g., {'severity': 'heavy'})
-    
-    Returns:
-        prompt : LLM에 주는 natural-language instruction
-    """
 
     # --------------------------
     # 장면(scene) 자동 할당
@@ -121,3 +110,66 @@ if __name__ == "__main__":
     print("=== Generated Prompt ===")
     print(prompt)
     print("\n[tokenizer_utils] Self-test 완료.\n")
+ """
+
+# ver2
+# G:\VETNet_pilot\models\pilot\tokenizer_utils.py
+import torch
+
+# -----------------------------
+# Prompts (Dual-head)
+# -----------------------------
+# Strategy prompt: used to stabilize LLM context for latent strategy regression (z)
+STRATEGY_PROMPT = (
+    "You are a restoration strategy controller. "
+    "Given the visual embedding, form an internal restoration strategy representation."
+)
+
+# XAI prompt: used only when generating explanation text
+XAI_PROMPT = (
+    "You are a vision-based image restoration controller."
+    "Based ONLY on the visual content provided, explain in 3–5 short sentences what restoration operations are being applied to this image."
+    "Do NOT generate code, examples, or tutorials. Focus on actions such as rain suppression, haze removal, structure preservation, and texture recovery."
+
+)
+
+
+def build_strategy_prompt(task_hint: str = "") -> str:
+    if task_hint and len(task_hint.strip()) > 0:
+        return STRATEGY_PROMPT + " Task hint: " + task_hint.strip()
+    return STRATEGY_PROMPT
+
+
+def build_xai_prompt(task_hint: str = "") -> str:
+    if task_hint and len(task_hint.strip()) > 0:
+        return XAI_PROMPT + " Task hint: " + task_hint.strip()
+    return XAI_PROMPT
+
+
+def ensure_pad_token(tokenizer):
+    # Some causal LMs don't have pad_token by default
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    return tokenizer
+
+
+def tokenize_prompt(tokenizer, prompt: str, device: torch.device, max_length: int = 128):
+    """
+    Tokenize text prompt for LLM.
+
+    NOTE:
+    - Training does NOT use generate(); prompt is a fixed context anchor.
+    - For XAI generation, we can reuse this to provide a consistent conditioning prompt.
+    """
+    tok = tokenizer(
+        prompt,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+    )
+    tok = {k: v.to(device) for k, v in tok.items()}
+    return tok

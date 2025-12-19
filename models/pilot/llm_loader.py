@@ -1,4 +1,4 @@
-# G:/VETNet_pilot/models/pilot/llm_loader.py
+""" # G:/VETNet_pilot/models/pilot/llm_loader.py
 # LLaMA/Mistral 같은 LLM을 4bit + LoRA로 불러오는 모듈
 import os
 import sys
@@ -14,10 +14,7 @@ import torch.nn as nn
 
 @dataclass
 class LLMConfig:
-    """
-    Phase-2에서 사용할 LLM 설정값 모음.
-    필요하면 configs/train_phase2.yaml에서 이 값들을 받아서 생성해도 됨.
-    """
+
     base_model_name: str = "mistralai/Mistral-7B-v0.1"   # 네가 DPR-Net에서 쓰던 모델
     load_in_4bit: bool = True
     use_lora: bool = True
@@ -34,10 +31,7 @@ class LLMConfig:
 
 
 class LLMWithLoRA(nn.Module):
-    """
-    - AutoModelForCausalLM + (Optional) LoRA 래퍼
-    - generate() / forward()를 그대로 쓸 수 있게 해준다.
-    """
+
 
     def __init__(self, config: LLMConfig):
         super().__init__()
@@ -141,9 +135,6 @@ class LLMWithLoRA(nn.Module):
 
     # ---------------------------------------------------------
     def forward(self, input_ids, attention_mask=None, **kwargs):
-        """
-        기본 forward: hidden_states까지 반환.
-        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -159,14 +150,6 @@ class LLMWithLoRA(nn.Module):
         prompt: str,
         device: Optional[torch.device] = None,
     ):
-        """
-        Phase2에서 주로 쓰게 될 함수:
-
-        - 입력: prompt 문자열
-        - 출력:
-            - generated_text: 생성된 전체 텍스트
-            - last_hidden: 마지막 layer hidden_states (B, L, C)
-        """
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -210,11 +193,7 @@ class LLMWithLoRA(nn.Module):
 # 모듈 내 헬퍼 함수
 # ============================================================
 def load_llm(config: Optional[LLMConfig] = None) -> LLMWithLoRA:
-    """
-    외부에서 간단히 사용하는 helper:
-    from models.pilot.llm_loader import load_llm
-    llm = load_llm()
-    """
+
     if config is None:
         config = LLMConfig()
     llm = LLMWithLoRA(config)
@@ -225,13 +204,7 @@ def load_llm(config: Optional[LLMConfig] = None) -> LLMWithLoRA:
 # Self-test: python models/pilot/llm_loader.py 로 실행
 # ============================================================
 if __name__ == "__main__":
-    """
-    간단한 디버그용 스크립트:
 
-    - LLM 로딩
-    - 짧은 prompt에 대해 strategy 텍스트 생성
-    - hidden_states shape 출력
-    """
     print("[llm_loader] Self-test 시작")
 
     try:
@@ -270,3 +243,96 @@ if __name__ == "__main__":
             "\n→ transformers / peft / bitsandbytes 설치 여부와, "
             "base_model_name이 올바른지 확인해줘."
         )
+ """
+
+# ver2
+# G:\VETNet_pilot\models\pilot\llm_loader.py
+import os
+import torch
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+try:
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    PEFT_OK = True
+except Exception as e:
+    PEFT_OK = False
+
+
+def _debug_env():
+    print("[llm_loader] CUDA available:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print("[llm_loader] GPU:", torch.cuda.get_device_name(0))
+        print("[llm_loader] CUDA capability:", torch.cuda.get_device_capability(0))
+
+
+def load_llm_with_lora(
+    model_name: str = "meta-llama/Llama-3.2-1B-Instruct",
+    device: str = "cuda",
+    load_in_4bit: bool = True,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    target_modules=None,
+):
+    """
+    Loads a causal LLM and applies LoRA.
+    - For training stability, we DO NOT call generate() in training steps.
+    - We'll use hidden states as a continuous regressor output.
+
+    Requires:
+      pip install transformers peft bitsandbytes accelerate
+    """
+    _debug_env()
+
+    if target_modules is None:
+        # Common target modules for LLaMA/Mistral-like architectures
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+    print(f"[llm_loader] Loading tokenizer: {model_name}")
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    # Ensure pad token exists
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token if tok.eos_token is not None else tok.unk_token
+
+    print(f"[llm_loader] Loading LLM: {model_name} (4bit={load_in_4bit})")
+
+    kwargs = dict(
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+
+    if load_in_4bit:
+        # bitsandbytes 4-bit quantization
+        kwargs.update(dict(load_in_4bit=True))
+    else:
+        kwargs.update(dict(load_in_4bit=False))
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    model.train()
+
+    if not PEFT_OK:
+        raise RuntimeError(
+            "[llm_loader] peft is not available. Install with: pip install peft"
+        )
+
+    # If k-bit training, prepare
+    if load_in_4bit:
+        model = prepare_model_for_kbit_training(model)
+
+    lora_cfg = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules,
+    )
+    model = get_peft_model(model, lora_cfg)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[llm_loader] LoRA attached. Trainable params: {trainable:,} / Total: {total:,} "
+          f"({100.0*trainable/total:.4f}%)")
+
+    return model, tok

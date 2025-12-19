@@ -1,12 +1,4 @@
-# G:/VETNet_pilot/models/pilot/strategy_head.py
-"""
-StrategyHead: CLIP Vision Encoder + (Optional) LLM Strategy Generator
-
-Phase-2 핵심 원칙:
-- CLIP Vision Encoder: frozen + torch.no_grad()
-- Projection (proj_z, proj_tokens): 반드시 grad 활성
-"""
-
+""" # G:/VETNet_pilot/models/pilot/strategy_head.py
 from __future__ import annotations
 
 import os
@@ -171,3 +163,72 @@ if __name__ == "__main__":
     print("z:", out["strategy_vector"].shape)
     print("texts:", out["strategy_texts"])
     print("[strategy_head] Self-test 완료")
+ """
+
+
+ # ver2
+ # G:\VETNet_pilot\models\pilot\strategy_head.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class StrategyHead(nn.Module):
+    """
+    Takes:
+      - LLM hidden states (B, T, D_lm) or a pooled vector (B, D_lm)
+    Outputs:
+      - strategy tokens S: (B, K, C)
+
+    This is the "z -> S" adapter g_psi(z).
+    """
+
+    def __init__(
+        self,
+        lm_dim: int,
+        strategy_dim: int = 512,   # z dim
+        K: int = 3,               # number of strategy tokens
+        C: int = 256,             # channel dim expected by VETNet control bridge
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.lm_dim = lm_dim
+        self.strategy_dim = strategy_dim
+        self.K = K
+        self.C = C
+
+        self.pool = "mean"  # stable default
+        self.z_proj = nn.Sequential(
+            nn.LayerNorm(lm_dim),
+            nn.Linear(lm_dim, strategy_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(strategy_dim, strategy_dim),
+        )
+
+        self.s_proj = nn.Sequential(
+            nn.LayerNorm(strategy_dim),
+            nn.Linear(strategy_dim, K * C),
+        )
+
+    def forward(self, lm_hidden: torch.Tensor):
+        """
+        lm_hidden:
+          - (B, T, D) or (B, D)
+        returns:
+          S: (B, K, C)
+          z: (B, strategy_dim)
+        """
+        if lm_hidden.dim() == 3:
+            # (B,T,D) -> pooled (B,D)
+            if self.pool == "mean":
+                pooled = lm_hidden.mean(dim=1)
+            else:
+                pooled = lm_hidden[:, 0]  # fallback: first token
+        else:
+            pooled = lm_hidden
+
+        z = self.z_proj(pooled)  # (B, strategy_dim)
+        s_flat = self.s_proj(z)  # (B, K*C)
+        S = s_flat.view(-1, self.K, self.C)  # (B,K,C)
+        return S, z
