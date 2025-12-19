@@ -127,11 +127,16 @@ STRATEGY_PROMPT = (
 
 # XAI prompt: used only when generating explanation text
 XAI_PROMPT = (
-    "You are a vision-based image restoration controller."
-    "Based ONLY on the visual content provided, explain in 3–5 short sentences what restoration operations are being applied to this image."
-    "Do NOT generate code, examples, or tutorials. Focus on actions such as rain suppression, haze removal, structure preservation, and texture recovery."
-
+    "Explain the restoration strategy for the current image.\n"
+    "Write exactly 4 sentences.\n"
+    "Sentence 1: overall degradation characteristics.\n"
+    "Sentence 2: Stage 1 strategy.\n"
+    "Sentence 3: Stage 2 strategy.\n"
+    "Sentence 4: Stage 3 strategy.\n"
+    "Do not include any headings, lists, examples, or quoted text."
 )
+
+
 
 
 def build_strategy_prompt(task_hint: str = "") -> str:

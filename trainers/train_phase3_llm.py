@@ -5,13 +5,14 @@ import time
 import glob
 import random
 import numpy as np
+import textwrap
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -131,6 +132,7 @@ def calc_ssim(pred, gt):
         l1 = torch.mean(torch.abs(pred - gt)).item()
         return max(0.0, 1.0 - l1)
 
+    # ✅ bfloat16 -> float (numpy unsupported for bfloat16)
     pred_np = pred.detach().float().clamp(0, 1).cpu().numpy()
     gt_np = gt.detach().float().clamp(0, 1).cpu().numpy()
 
@@ -141,6 +143,102 @@ def calc_ssim(pred, gt):
         g = np.transpose(gt_np[i], (1, 2, 0))
         vals.append(ssim_fn(p, g, channel_axis=2, data_range=1.0))
     return float(np.mean(vals))
+
+
+# ============================================================
+# ✅ Visualization utils: save (inp|pred|gt) + XAI text every N iters
+# ============================================================
+def _tensor_to_pil(x_chw: torch.Tensor) -> Image.Image:
+    """
+    x_chw: (3,H,W), assumed in [0,1]
+    """
+    x = x_chw.detach().float().clamp(0, 1).cpu()
+    x = (x * 255.0 + 0.5).to(torch.uint8)
+    x = x.permute(1, 2, 0).numpy()  # HWC
+    return Image.fromarray(x, mode="RGB")
+
+
+def _draw_label(draw: ImageDraw.ImageDraw, xy, text, font):
+    # subtle outline for readability
+    x, y = xy
+    for ox, oy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)]:
+        draw.text((x+ox, y+oy), text, font=font, fill=(0, 0, 0))
+    draw.text((x, y), text, font=font, fill=(255, 255, 255))
+
+
+def save_triplet_with_xai(
+    save_path: str,
+    inp_img: Image.Image,
+    pred_img: Image.Image,
+    gt_img: Image.Image,
+    xai_text: str,
+    meta_text: str = "",
+):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # fonts (default is safest)
+    try:
+        font = ImageFont.load_default()
+    except:
+        font = None
+
+    # layout
+    pad = 12
+    gap = 10
+    label_h = 18
+    img_w, img_h = inp_img.size
+
+    # xai area
+    xai_text = (xai_text or "").strip()
+    if len(xai_text) == 0:
+        xai_text = "(XAI: empty)"
+
+    # wrap text
+    wrap_width = 110  # tuned for 3x256 layout; safe for default font
+    wrapped = textwrap.fill(xai_text, width=wrap_width)
+
+    # estimate xai height
+    lines = wrapped.count("\n") + 1
+    line_h = 14
+    xai_h = pad + lines * line_h + pad
+    if meta_text:
+        xai_h += line_h + 6
+
+    out_w = pad + img_w + gap + img_w + gap + img_w + pad
+    out_h = pad + label_h + 4 + img_h + pad + xai_h + pad
+
+    canvas = Image.new("RGB", (out_w, out_h), (20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+
+    # paste images
+    x0 = pad
+    y0 = pad + label_h + 4
+    canvas.paste(inp_img, (x0, y0))
+    canvas.paste(pred_img, (x0 + img_w + gap, y0))
+    canvas.paste(gt_img, (x0 + (img_w + gap) * 2, y0))
+
+    # labels
+    _draw_label(draw, (x0, pad), "INPUT", font)
+    _draw_label(draw, (x0 + img_w + gap, pad), "RESTORED", font)
+    _draw_label(draw, (x0 + (img_w + gap) * 2, pad), "GT", font)
+
+    # xai box
+    box_y = y0 + img_h + pad
+    box_x = pad
+    box_w = out_w - 2 * pad
+    box_h = out_h - box_y - pad
+    draw.rectangle([box_x, box_y, box_x + box_w, box_y + box_h], fill=(245, 245, 245))
+
+    tx = box_x + pad
+    ty = box_y + pad
+
+    if meta_text:
+        draw.text((tx, ty), meta_text, font=font, fill=(0, 0, 0))
+        ty += line_h + 6
+
+    draw.text((tx, ty), wrapped, font=font, fill=(0, 0, 0))
+
+    canvas.save(save_path)
 
 
 # ============================================================
@@ -188,12 +286,8 @@ class Phase3Controller(nn.Module):
         ensure_pad_token(self.tok)
 
         # ============================================================
-        # ✅ [FIX-1] stage_proj 정의 (없어서 AttributeError 났던 부분)
+        # ✅ stage_proj 정의 (없어서 AttributeError 났던 부분)
         # ============================================================
-        # StrategyHead가 출력하는 S_raw는 (B,K,C=256) 고정.
-        # VETNet 내부 stage별 feature channel에 맞춰서 (B,K,C_stage)로 변환해야 함.
-        # 에러 로그로 stage1의 X_flat C=64는 확정.
-        # 일반적으로 stage2=128, stage3=256 (VETNet 설계 관례)로 맞춘다.
         base_C = 256
         self.stage_proj = nn.ModuleDict({
             "stage1": nn.Linear(base_C, 64, bias=True),
@@ -253,10 +347,8 @@ class Phase3Controller(nn.Module):
         """
         Train-time forward (no generate).
         Returns:
-          pred, S, z
+          pred, S_raw, z
         """
-        B = inp.size(0)
-
         prefix = self._make_prefix(inp)  # (B,P,lm_dim)
         inputs_embeds, attn_mask2 = self._prepare_inputs_embeds(prefix, self.strategy_prompt)
 
@@ -272,45 +364,43 @@ class Phase3Controller(nn.Module):
         prefix_hidden = last_hidden[:, :self.prefix_tokens, :]
         pooled = prefix_hidden.mean(dim=1)  # (B,lm_dim)
 
-        S_raw, z = self.strategy_head(pooled)  # S_raw: (B,K,256)
+        S_raw, z = self.strategy_head(pooled)  # (B,K,256)
 
-        # ============================================================
-        # ✅ [FIX-2] VETNet stage별 channel 요구에 맞춰 projection 후 dict로 전달
-        #   - stage1: (B,K,64)
-        #   - stage2: (B,K,128)
-        #   - stage3: (B,K,256)
-        # ============================================================
+        # ✅ VETNet stage별 channel 요구에 맞춰 projection 후 dict로 전달
         strategy_tokens = {
-            "stage1": self.stage_proj["stage1"](S_raw),
-            "stage2": self.stage_proj["stage2"](S_raw),
-            "stage3": self.stage_proj["stage3"](S_raw),
+            "stage1": self.stage_proj["stage1"](S_raw),  # (B,K,64)
+            "stage2": self.stage_proj["stage2"](S_raw),  # (B,K,128)
+            "stage3": self.stage_proj["stage3"](S_raw),  # (B,K,256)
         }
 
         pred = self.vetnet(inp, strategy_tokens=strategy_tokens)
-
         return pred, S_raw, z
 
     @torch.no_grad()
     def generate_xai(self, inp: torch.Tensor, max_new_tokens: int = 96, do_sample: bool = False):
-        """
-        Inference-only explanation generation.
-        Uses the same visual prefix but swaps to XAI prompt.
-        Returns list[str] of size B.
-        """
         self.llm.eval()
 
         prefix = self._make_prefix(inp)
         inputs_embeds, attn_mask2 = self._prepare_inputs_embeds(prefix, self.xai_prompt)
 
-        gen_ids = self.llm.generate(
+        gen_out = self.llm.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attn_mask2,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
-            num_beams=1 if not do_sample else 1,
+            num_beams=1,
             use_cache=True,
+            return_dict_in_generate=True,
         )
-        texts = self.tok.batch_decode(gen_ids, skip_special_tokens=True)
+
+        # ✅ "입력 길이"만큼 자르고 생성된 부분만 디코딩
+        seq = gen_out.sequences  # (B, seq_len_total)
+        input_lens = attn_mask2.sum(dim=1).to(torch.long)  # (B,)
+
+        texts = []
+        for b in range(seq.size(0)):
+            gen_ids = seq[b, input_lens[b]:]  # 생성된 토큰만
+            texts.append(self.tok.decode(gen_ids, skip_special_tokens=True).strip())
         return texts
 
 
@@ -333,11 +423,9 @@ class Config:
     # Models
     clip_name = "openai/clip-vit-large-patch14"
     llm_name = "microsoft/Phi-3-mini-4k-instruct"
-    #llm_name = "mistralai/Mistral-7B-Instruct-v0.2"
-    #llm_name = "meta-llama/Llama-3.2-1B-Instruct"  # 기다려야됨
     llm_4bit = True
 
-    # Strategy token spec (MUST match Phase-2 control bridge expectations)
+    # Strategy token spec
     K = 3
     C = 256
     strategy_dim = 512
@@ -348,13 +436,17 @@ class Config:
 
     # XAI logging control
     enable_xai = True
-    xai_every_epochs = 1     # generate once per epoch (first batch)
+    xai_every_epochs = 1
     xai_max_new_tokens = 96
     xai_do_sample = False
 
     # Save / log
     save_root = "G:/VETNet_pilot/checkpoints/phase3_llm"
+    results_root = "G:/VETNet_pilot/results/phase3_llm"
     log_every = 20
+
+    # ✅ iteration마다 결과 저장
+    save_vis_every_iters = 100  # <==== 요청: iteration 100마다 저장
 
 
 # ============================================================
@@ -363,6 +455,7 @@ class Config:
 def train():
     cfg = Config()
     os.makedirs(cfg.save_root, exist_ok=True)
+    os.makedirs(cfg.results_root, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
@@ -429,7 +522,7 @@ def train():
         prefix_tokens=cfg.prefix_tokens,
     ).to(device)
 
-    # Train params: LoRA params + strategy_head + clip_to_prefix (created lazily but is trainable)
+    # Train params
     train_params = [p for p in model.parameters() if p.requires_grad]
     total_trainable = sum(p.numel() for p in train_params)
     print("[Trainable] total params =", f"{total_trainable:,}")
@@ -485,19 +578,59 @@ def train():
                     "z_mean": f"{z.detach().mean().item():.4f}",
                 })
 
+            # ============================================================
+            # ✅ iteration 100마다 (원본|복원|gt) + XAI 텍스트를 한 장으로 저장
+            # ============================================================
+            if (global_step % cfg.save_vis_every_iters) == 0:
+                model.eval()
+                try:
+                    # 1 sample only (속도/메모리)
+                    inp1 = inp[:1]
+                    gt1 = gt[:1]
+                    pred1 = pred[:1]
+
+                    xai_text = ""
+                    if cfg.enable_xai:
+                        xai_texts = model.generate_xai(
+                            inp1,
+                            max_new_tokens=cfg.xai_max_new_tokens,
+                            do_sample=cfg.xai_do_sample,
+                        )
+                        xai_text = xai_texts[0] if len(xai_texts) > 0 else ""
+
+                    # make PIL images
+                    inp_img = _tensor_to_pil(inp1[0])
+                    pred_img = _tensor_to_pil(pred1[0])
+                    gt_img = _tensor_to_pil(gt1[0])
+
+                    meta = f"epoch={epoch:03d}  iter={it:05d}  global_step={global_step:07d}  loss={loss.item():.4f}  psnr={psnr:.2f}  ssim={ssim:.4f}"
+                    out_name = f"e{epoch:03d}_it{it:05d}_gs{global_step:07d}.png"
+                    out_path = os.path.join(cfg.results_root, out_name)
+
+                    save_triplet_with_xai(
+                        save_path=out_path,
+                        inp_img=inp_img,
+                        pred_img=pred_img,
+                        gt_img=gt_img,
+                        xai_text=xai_text,
+                        meta_text=meta,
+                    )
+                    print(f"\n[Saved:VIS] {out_path}\n")
+                except Exception as e:
+                    print("\n[VIS] save failed:", repr(e), "\n")
+                model.train()
+
             # XAI generation (optional, no-grad) - do once per epoch on first batch
             if cfg.enable_xai and (not did_xai_this_epoch) and (epoch % cfg.xai_every_epochs == 0):
-                # generate after a few steps to avoid slowing pbar too much
-                # Switch to eval for generation only
                 model.eval()
                 try:
                     xai_texts = model.generate_xai(
-                        inp[:1],  # just one sample for debug
+                        inp[:1],
                         max_new_tokens=cfg.xai_max_new_tokens,
                         do_sample=cfg.xai_do_sample,
                     )
                     print("\n[XAI] sample explanation:")
-                    print(xai_texts[0])
+                    print(xai_texts[0] if len(xai_texts) > 0 else "(empty)")
                     print("-" * 60)
                 except Exception as e:
                     print("\n[XAI] generation failed:", repr(e))
@@ -543,6 +676,8 @@ if __name__ == "__main__":
         print("   -", os.path.join(Config.cache_root, f))
     print("[MAIN] XAI enabled:", Config.enable_xai)
     print("[MAIN] XAI every epochs:", Config.xai_every_epochs)
+    print("[MAIN] Results root:", Config.results_root)
+    print("[MAIN] Save vis every iters:", Config.save_vis_every_iters)
     print("============================================================")
 
     train()
