@@ -1,4 +1,4 @@
-""" # PNG 읽어오기
+# PNG 읽어오기
 # G:/VETNet_pilot/trainers/train_phase1_backbone.py
 import os, sys, time, numpy as np
 import torch
@@ -26,14 +26,14 @@ except:
 
 # ============================================================
 class Config:
-    cache_root = "G:/VETNet_pilot/preload_cache"
+    cache_root = "E:/VETNet_Pilot/preload_cache"
 
-    save_root = "G:/VETNet_pilot/checkpoints/phase1_backbone"
-    results_root = "G:/VETNet_pilot/results/phase1_backbone"
+    save_root = "E:/VETNet_pilot/checkpoints/phase1_backbone"
+    results_root = "E:/VETNet_pilot/results/phase1_backbone"
 
     epochs = 100
     batch_size = 2
-    num_workers = 0     # PNG 캐시에서는 0이 가장 빠름
+    num_workers = 0
     lr = 3e-4
 
     in_channels = 3
@@ -48,8 +48,8 @@ class Config:
     metric_images_per_batch = 2
     use_amp = True
 
-    # 🔵 새로 추가: 미리보기로 저장할 이미지 수
     preview_count = 3
+    iter_save_interval = 150   # 🔵 추가: iteration 저장 주기
 
 
 cfg = Config()
@@ -76,14 +76,11 @@ def save_triplet(input, pred, gt, path):
     Image.fromarray(canvas).save(path)
 
 
-# 🔵 랜덤 미리보기 저장 기능
 def save_preview_images(inputs, preds, gts, epoch, save_dir, count=3):
     os.makedirs(save_dir, exist_ok=True)
 
     total = inputs.size(0)
     count = min(count, total)
-
-    # 랜덤 선택
     idxs = np.random.choice(total, count, replace=False)
 
     for i, idx in enumerate(idxs):
@@ -106,11 +103,11 @@ def train_phase1():
 
     os.makedirs(cfg.save_root, exist_ok=True)
     os.makedirs(cfg.results_root, exist_ok=True)
+    os.makedirs(os.path.join(cfg.results_root, "iter"), exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[Device]", device)
 
-    # ============================================================
     dataset = MultiTaskDatasetCache(cfg.cache_root, size=256)
     loader = DataLoader(
         dataset,
@@ -123,7 +120,6 @@ def train_phase1():
 
     print("[Data] Total cached samples =", len(dataset))
 
-    # ------------------------------------------------------------
     model = VETNetBackbone(
         in_channels=cfg.in_channels,
         out_channels=cfg.out_channels,
@@ -154,12 +150,12 @@ def train_phase1():
 
         pbar = tqdm(loader, ncols=120, desc=f"Epoch {epoch}")
 
-        # 🔵 미리보기 저장용 임시 버퍼
         preview_inp = None
         preview_gt = None
         preview_pred = None
 
-        for batch in pbar:
+        for it, batch in enumerate(pbar, start=1):
+
             inp = batch["input"].to(device)
             gt = batch["gt"].to(device)
 
@@ -175,13 +171,20 @@ def train_phase1():
 
             pred_c = pred.clamp(0, 1)
 
-            # 🔵 미리보기용 첫 배치를 저장
             if preview_inp is None:
                 preview_inp = inp.detach().cpu()
                 preview_gt = gt.detach().cpu()
                 preview_pred = pred_c.detach().cpu()
 
-            # 평가
+            # 🔵 150 iteration마다 저장
+            if it % cfg.iter_save_interval == 0:
+                iter_path = os.path.join(
+                    cfg.results_root,
+                    "iter",
+                    f"epoch_{epoch:03d}_iter_{it:05d}.png"
+                )
+                save_triplet(inp[0], pred_c[0], gt[0], iter_path)
+
             ps, ss = compute_psnr_ssim(pred_c, gt)
 
             loss_sum += loss.item()
@@ -203,22 +206,17 @@ def train_phase1():
 
         print(f"\n[Epoch {epoch}] Loss={epoch_loss:.4f}  PSNR={epoch_psnr:.2f}  SSIM={epoch_ssim:.4f}")
 
-        # ======================================================
-        # 🔵 랜덤 Preview 이미지 저장
-        # ======================================================
-        save_preview_images(preview_inp, preview_pred, preview_gt,
-                            epoch, cfg.results_root, count=cfg.preview_count)
+        save_preview_images(
+            preview_inp, preview_pred, preview_gt,
+            epoch, cfg.results_root, count=cfg.preview_count
+        )
 
-        # ======================================================
-        # 원래 epoch 이미지 저장 (첫 1장)
         img_path = os.path.join(
             cfg.results_root,
             f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.4f}.png",
         )
         save_triplet(preview_inp[0], preview_pred[0], preview_gt[0], img_path)
 
-        # ======================================================
-        # checkpoint 저장
         ckpt_path = os.path.join(
             cfg.save_root,
             f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.4f}.pth",
@@ -243,12 +241,12 @@ def train_phase1():
 
 
 if __name__ == "__main__":
-    train_phase1() """
+    train_phase1()
 
 
 # 이어서 학습
 # G:/VETNet_pilot/trainers/train_phase1_backbone.py
-import os, sys, time, numpy as np
+""" import os, sys, time, numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -357,9 +355,6 @@ def compute_psnr_ssim(pred, gt):
 
 # 🔵 체크포인트 로드 함수 (추가)
 def load_checkpoint(save_root, model, optimizer, scheduler):
-    """
-    save_root에서 가장 최근 에포크의 체크포인트 파일을 찾아 로드합니다.
-    """
     start_epoch = 1
     best_ssim = -1.0
     latest_ckpt_path = None
@@ -576,4 +571,4 @@ def train_phase1():
 
 
 if __name__ == "__main__":
-    train_phase1()
+    train_phase1() """

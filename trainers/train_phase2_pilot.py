@@ -711,7 +711,8 @@ if __name__ == "__main__":
     train_phase2(cfg)
  """
 
-# 설정변경
+""" # 설정변경
+# 이어서 학습
 import os
 import sys
 import json
@@ -851,13 +852,13 @@ class Phase2Config:
     device: str = "cuda"
     use_amp: bool = True
 
-    phase1_ckpt: str = r"G:\VETNet_pilot\checkpoints\phase1_backbone\epoch_060_L0.0116_P35.76_S0.9594.pth"
-    out_dir: str = r"G:\VETNet_pilot\checkpoints\phase2_pilot"
+    phase1_ckpt: str = r"E:\VETNet_Pilot\checkpoints\phase1_backbone\epoch_021_L0.0204_P31.45_S0.9371.pth"
+    out_dir: str = r"E:\VETNet_Pilot\checkpoints\phase2_pilot"
 
-    preload_cache_root: str = r"G:\VETNet_pilot\preload_cache"
-    pairs_cache_json: str = r"G:\VETNet_pilot\data_cache\pairs_cache_phase2.json"
+    preload_cache_root: str = r"E:\VETNet_Pilot\preload_cache"
+    pairs_cache_json: str = r"E:\VETNet_Pilot\data_cache\pairs_cache_phase2.json"
 
-    preview_dir: str = r"G:\VETNet_pilot\results\phase2_pilot\iter_preview"
+    preview_dir: str = r"E:\VETNet_Pilot\results\phase2_pilot\iter_preview"
     preview_interval: int = 100
 
     metric_interval: int = 20
@@ -990,3 +991,378 @@ def train_phase2(cfg: Phase2Config):
 if __name__ == "__main__":
     cfg = Phase2Config()
     train_phase2(cfg)
+
+ """
+
+# 처음부터 학습
+# E:\VETNet_Pilot\trainers\train_phase2_pilot.py
+# E:\VETNet_Pilot\trainers\train_phase2_pilot.py
+import os
+import sys
+import json
+import random
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+from datetime import datetime
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from torchvision.utils import save_image
+
+# ------------------------------------------------------------
+# ROOT 경로 세팅
+# ------------------------------------------------------------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(CURRENT_DIR)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+print(f"[train_phase2_pilot] ROOT = {ROOT}")
+
+# ------------------------------------------------------------
+# Imports (project)
+# ------------------------------------------------------------
+from models.vllm_vetnet import VLLMVETNet, VLLMVETNetConfig
+
+# ------------------------------------------------------------
+# SSIM
+# ------------------------------------------------------------
+try:
+    from pytorch_msssim import ssim as msssim_ssim
+    _HAS_MSSSIM = True
+    print("[Loss/Metric] Using pytorch_msssim.ssim")
+except Exception:
+    _HAS_MSSSIM = False
+    print("[Loss/Metric] pytorch_msssim not found")
+
+# ============================================================
+# Utils
+# ============================================================
+def set_seed(seed: int = 1234):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def _safe_makedirs(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def _to_01(x: torch.Tensor):
+    return x.clamp(0.0, 1.0)
+
+@torch.no_grad()
+def compute_psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    pred = _to_01(pred)
+    gt = _to_01(gt)
+    mse = (pred - gt).pow(2).mean(dim=(1, 2, 3))
+    psnr = 10.0 * torch.log10(1.0 / (mse + 1e-10))
+    return psnr.mean().item()
+
+@torch.no_grad()
+def compute_ssim(pred: torch.Tensor, gt: torch.Tensor) -> float:
+    if not _HAS_MSSSIM:
+        return float("nan")
+
+    # 🔥 핵심 FIX: 반드시 FP32로 변환 (AMP half 방지)
+    pred = _to_01(pred).float()
+    gt   = _to_01(gt).float()
+
+    return float(
+        msssim_ssim(
+            pred, gt,
+            data_range=1.0,
+            size_average=True
+        ).item()
+    )
+
+# ============================================================
+# TXT Logger (NEW)
+# ============================================================
+class TxtLogger:
+    """
+    - stdout로 찍히는 주요 로그를 txt로도 저장
+    - tqdm postfix는 주기적으로 한 줄로 저장
+    """
+    def __init__(self, log_path: str):
+        self.log_path = log_path
+        _safe_makedirs(os.path.dirname(log_path))
+        self.f = open(log_path, "a", encoding="utf-8")
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+    def write(self, s: str):
+        # 파일 저장 + 즉시 flush
+        self.f.write(s + "\n")
+        self.f.flush()
+
+    def header(self, cfg):
+        self.write("=" * 80)
+        self.write(f"[START] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.write(f"[LOG_PATH] {self.log_path}")
+        self.write("[CONFIG]")
+        for k, v in cfg.__dict__.items():
+            self.write(f"  - {k}: {v}")
+        self.write("=" * 80)
+
+# ============================================================
+# EMA helper
+# ============================================================
+class EMA:
+    def __init__(self, beta: float = 0.95):
+        self.beta = beta
+        self.v: Dict[str, float] = {}
+
+    def update(self, key: str, value: float):
+        if value != value:  # NaN
+            return
+        if key not in self.v:
+            self.v[key] = value
+        else:
+            self.v[key] = self.beta * self.v[key] + (1.0 - self.beta) * value
+
+    def get(self, key: str, default=float("nan")):
+        return self.v.get(key, default)
+
+# ============================================================
+# Dataset
+# ============================================================
+class PreloadCacheDataset(Dataset):
+    def __init__(self, pairs: List[Tuple[str, str]], patch_size: int = 256):
+        self.pairs = pairs
+        self.patch_size = patch_size
+        from torchvision.io import read_image
+        self._read_image = read_image
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def _load(self, p: str):
+        x = self._read_image(p).float() / 255.0
+        if x.size(0) == 1:
+            x = x.repeat(3, 1, 1)
+        return x[:3]
+
+    def __getitem__(self, idx):
+        inp_path, gt_path = self.pairs[idx]
+        inp = self._load(inp_path)
+        gt = self._load(gt_path)
+
+        _, H, W = inp.shape
+        ps = self.patch_size
+        if H > ps and W > ps:
+            top = random.randint(0, H - ps)
+            left = random.randint(0, W - ps)
+            inp = inp[:, top:top+ps, left:left+ps]
+            gt = gt[:, top:top+ps, left:left+ps]
+
+        return {"inp": inp, "gt": gt}
+
+# ============================================================
+# Config
+# ============================================================
+@dataclass
+class Phase2Config:
+    seed: int = 1234
+    device: str = "cuda"
+    use_amp: bool = True
+
+    phase1_ckpt: str = r"E:\VETNet_Pilot\checkpoints\phase1_backbone\epoch_021_L0.0204_P31.45_S0.9371.pth"
+    pairs_cache_json: str = r"E:\VETNet_Pilot\data_cache\pairs_cache_phase2.json"
+    out_dir: str = r"E:\VETNet_Pilot\checkpoints\phase2_pilot"
+
+    preview_dir: str = r"E:\VETNet_Pilot\results\phase2_pilot\iter_preview"
+    preview_interval: int = 100
+    metric_interval: int = 20
+
+    # ✅ TXT 로그 저장 경로 (NEW)
+    log_dir: str = r"E:\VETNet_Pilot\logs\phase2_pilot"
+    log_name: str = ""  # 비우면 자동으로 timestamp
+
+    epochs: int = 120
+    warmup_epochs: int = 5
+    lr: float = 2e-5
+    batch_size: int = 1
+    num_workers: int = 4
+    patch_size: int = 256
+
+    strategy_dim: int = 256
+    num_tokens: int = 4
+    stage_dims: Tuple[int, int, int, int] = (64, 128, 256, 512)
+    enabled_stages: Tuple[str, ...] = ("stage1", "stage2", "stage3", "stage4")
+
+# ============================================================
+# Train
+# ============================================================
+def train_phase2(cfg: Phase2Config):
+    set_seed(cfg.seed)
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    print("[Device]", device)
+
+    _safe_makedirs(cfg.out_dir)
+    _safe_makedirs(cfg.preview_dir)
+    _safe_makedirs(cfg.log_dir)
+
+    # -------- logger init (NEW) --------
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_name = cfg.log_name.strip() if isinstance(cfg.log_name, str) else ""
+    if log_name == "":
+        log_name = f"phase2_pilot_{ts}.txt"
+    if not log_name.lower().endswith(".txt"):
+        log_name += ".txt"
+    log_path = os.path.join(cfg.log_dir, log_name)
+    logger = TxtLogger(log_path)
+    logger.header(cfg)
+    logger.write(f"[ROOT] {ROOT}")
+    logger.write(f"[Device] {device}")
+    logger.write(f"[SSIM] enabled={_HAS_MSSSIM}")
+    logger.write(f"[phase1_ckpt] {cfg.phase1_ckpt}")
+    logger.write(f"[pairs_cache_json] {cfg.pairs_cache_json}")
+
+    try:
+        with open(cfg.pairs_cache_json) as f:
+            pairs = [(d["inp"], d["gt"]) for d in json.load(f)]
+        logger.write(f"[CACHE] Loaded pairs = {len(pairs)}")
+
+        loader = DataLoader(
+            PreloadCacheDataset(pairs, cfg.patch_size),
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            drop_last=True,
+            pin_memory=True,
+        )
+
+        model = VLLMVETNet(
+            VLLMVETNetConfig(
+                strategy_dim=cfg.strategy_dim,
+                num_tokens=cfg.num_tokens,
+                stage_dims=cfg.stage_dims,
+                enabled_stages=cfg.enabled_stages,
+            )
+        ).to(device)
+
+        model.load_phase1_backbone(cfg.phase1_ckpt)
+        model.freeze_backbone()
+
+        opt = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=cfg.lr
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=cfg.use_amp)
+
+        ema = EMA(beta=0.95)
+        global_iter = 0
+
+        logger.write("[INIT] model created, backbone loaded+frozen, optimizer+scaler ready")
+
+        for epoch in range(1, cfg.epochs + 1):
+            model.train()
+            pbar = tqdm(loader, desc=f"[Epoch {epoch}/{cfg.epochs}]")
+
+            # epoch 시작 로그
+            logger.write("")
+            logger.write(f"===== Epoch {epoch}/{cfg.epochs} =====")
+
+            for batch in pbar:
+                global_iter += 1
+                inp = batch["inp"].to(device, non_blocking=True)
+                gt  = batch["gt"].to(device, non_blocking=True)
+
+                opt.zero_grad(set_to_none=True)
+
+                # OFF
+                with torch.no_grad(), torch.amp.autocast("cuda", enabled=cfg.use_amp):
+                    pred_off, _ = model(inp, use_strategy=False)
+                    pred_off = pred_off.detach()
+
+                # ON
+                with torch.amp.autocast("cuda", enabled=cfg.use_amp):
+                    pred_on, _ = model(inp, use_strategy=True)
+
+                    loss_on = (pred_on - gt).abs().mean()
+                    loss_cons = (pred_on - pred_off).abs().mean()
+
+                    if epoch <= cfg.warmup_epochs:
+                        loss = loss_cons
+                        w = 0.0
+                    else:
+                        w = min(1.0, (epoch - cfg.warmup_epochs) / 10.0)
+                        loss = w * loss_on + (1.0 - w) * loss_cons
+
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+
+                # ---------------- metrics ----------------
+                if global_iter % cfg.metric_interval == 0:
+                    with torch.no_grad():
+                        psnr_on  = compute_psnr(pred_on, gt)
+                        psnr_off = compute_psnr(pred_off, gt)
+                        ssim_on  = compute_ssim(pred_on, gt)
+                        ssim_off = compute_ssim(pred_off, gt)
+
+                        ema.update("PSNR_ON", psnr_on)
+                        ema.update("PSNR_OFF", psnr_off)
+                        ema.update("SSIM_ON", ssim_on)
+                        ema.update("SSIM_OFF", ssim_off)
+
+                    # tqdm 표시
+                    postfix = {
+                        "loss": f"{loss.item():.4f}",
+                        "L_on": f"{loss_on.item():.4f}",
+                        "L_cons": f"{loss_cons.item():.4f}",
+                        "PSNR_ON(EMA)": f"{ema.get('PSNR_ON'):.2f}",
+                        "SSIM_ON(EMA)": f"{ema.get('SSIM_ON'):.4f}",
+                        "PSNR_OFF(EMA)": f"{ema.get('PSNR_OFF'):.2f}",
+                        "SSIM_OFF(EMA)": f"{ema.get('SSIM_OFF'):.4f}",
+                        "w": f"{w:.3f}",
+                    }
+                    pbar.set_postfix(postfix)
+
+                    # txt 저장 (NEW)
+                    logger.write(
+                        f"[iter {global_iter:07d}] "
+                        f"loss={loss.item():.4f} "
+                        f"L_on={loss_on.item():.4f} "
+                        f"L_cons={loss_cons.item():.4f} "
+                        f"PSNR_ON(EMA)={ema.get('PSNR_ON'):.2f} "
+                        f"SSIM_ON(EMA)={ema.get('SSIM_ON'):.4f} "
+                        f"PSNR_OFF(EMA)={ema.get('PSNR_OFF'):.2f} "
+                        f"SSIM_OFF(EMA)={ema.get('SSIM_OFF'):.4f} "
+                        f"w={w:.3f}"
+                    )
+                else:
+                    # metric_interval 사이에도 최소 loss는 보이도록
+                    pbar.set_postfix({
+                        "loss": f"{loss.item():.4f}",
+                        "L_on": f"{loss_on.item():.4f}",
+                        "L_cons": f"{loss_cons.item():.4f}",
+                        "w": f"{w:.3f}",
+                    })
+
+                # preview 저장 (선택)
+                if cfg.preview_interval > 0 and (global_iter % cfg.preview_interval == 0):
+                    with torch.no_grad():
+                        grid = torch.cat([_to_01(inp), _to_01(pred_on), _to_01(gt)], dim=0)
+                        out_path = os.path.join(cfg.preview_dir, f"iter_{global_iter:07d}.png")
+                        save_image(grid, out_path, nrow=cfg.batch_size)
+                        logger.write(f"[preview] saved: {out_path}")
+
+            # epoch end 저장
+            ckpt_path = os.path.join(cfg.out_dir, f"phase2_epoch_{epoch:03d}.pth")
+            torch.save({"epoch": epoch, "model": model.state_dict()}, ckpt_path)
+            logger.write(f"[Saved] {ckpt_path}")
+
+        logger.write("")
+        logger.write(f"[DONE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    finally:
+        logger.close()
+        print(f"[LOG] saved to: {log_path}")
+
+# ============================================================
+if __name__ == "__main__":
+    train_phase2(Phase2Config())

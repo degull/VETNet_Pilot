@@ -334,16 +334,38 @@ if __name__ == "__main__":
  """
 
 
-# G:/VETNet_pilot/models/vllm_vetnet.py
 # ============================================================
 # Path A (StrategyHead) + Control Bridge + Path B (VETNetBackbone)
 # ============================================================
-# G:/VETNet_pilot/models/vllm_vetnet.py
+
 # Path A(StrategyHead) + ControlBridge(ControlProjection/StrategyRouter) + Path B(VETNetBackbone)
 # - Self-test: Phase-1 ckpt 로드 + strategy ON/OFF 비교
+
+# E:\VETNet_Pilot\models\vllm_vetnet.py
+
+# ============================================================
+# VLLM-VETNet (Phase2/3 pilot wrapper)
+# - backbone: VETNetBackbone
+# - strategy_head: produces strategy vector (and optional texts)
+# - control_projection: maps strategy vector -> stage tokens
+# - strategy_router: routes tokens into backbone stages
+#
+# Goals of this file:
+# 1) Run in multiple project states (StrategyHeadConfig may/may not exist)
+# 2) Accept different StrategyHead.forward signatures (with/without dataset_tag)
+# 3) Accept different output formats from StrategyHead and ControlProjection
+# 4) Provide a self-test that prints:
+#    [A] mean(|ON-OFF|) > 0
+#    [B] random tokens diff > 0
+#    [C] control tokens diff > 0
+# ============================================================
+
+# E:\VETNet_Pilot\models\vllm_vetnet.py
+# E:\VETNet_Pilot\models\vllm_vetnet.py
 import os
 import sys
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, Tuple
 
 import torch
@@ -353,8 +375,8 @@ import torch.nn.functional as F
 # ------------------------------------------------------------
 # ROOT 경로 세팅
 # ------------------------------------------------------------
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))   # .../models
-ROOT = os.path.dirname(CURRENT_DIR)                        # .../VETNet_pilot
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(CURRENT_DIR)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
@@ -364,9 +386,28 @@ print(f"[vllm_vetnet] ROOT = {ROOT}")
 # Imports
 # ------------------------------------------------------------
 from models.backbone.vetnet_backbone import VETNetBackbone
-from models.pilot.strategy_head import StrategyHead, StrategyHeadConfig
 from models.bridge.control_projection import ControlProjection, ControlProjectionConfig
 from models.bridge.strategy_router import StrategyRouter, StrategyRouterConfig
+
+# ============================================================
+# StrategyHead import (robust)
+# ============================================================
+try:
+    from models.pilot.strategy_head import StrategyHead, StrategyHeadConfig  # type: ignore
+    print("[vllm_vetnet] StrategyHeadConfig import OK")
+except Exception as e:
+    from models.pilot.strategy_head import StrategyHead  # type: ignore
+    print("[vllm_vetnet] StrategyHeadConfig missing -> fallback")
+    print("  - import error:", repr(e))
+
+    @dataclass
+    class StrategyHeadConfig:
+        # Phase-2에서는 StrategyHead를 "latent generator"로만 사용하므로
+        # 최소한 StrategyHead.__init__이 요구하는 인자(lm_dim 등)를 채워준다.
+        lm_dim: int = 256
+        strategy_dim: int = 256
+        num_tokens: int = 4
+        enable_llm: bool = False
 
 
 # ============================================================
@@ -384,43 +425,208 @@ class VLLMVETNetConfig:
     backbone_ffn_expansion_factor: float = 2.66
     backbone_bias: bool = False
 
-    # strategy head
-    clip_model_name: str = "openai/clip-vit-large-patch14"
-    clip_image_size: int = 224
+    # strategy/control
     strategy_dim: int = 256
     num_tokens: int = 4
-
-    # stage dims
     stage_dims: Tuple[int, int, int, int] = (64, 128, 256, 512)
-
-    # LLM
+    enabled_stages: Tuple[str, ...] = ("stage1", "stage2", "stage3", "stage4")
     enable_llm: bool = False
 
-    # router stages
-    enabled_stages: Tuple[str, ...] = ("stage1", "stage2", "stage3", "stage4")
+    # ------------------------------------------------
+    # (1) 토큰 영향 게이트 (learnable)
+    #   - 초기에는 거의 0(OFF와 유사)로 시작 → 점진적으로 토큰 영향 학습
+    # ------------------------------------------------
+    token_gate_init: float = -4.0   # sigmoid(-4) ≈ 0.018
 
-    # strategy input image
-    strategy_use_hr_as_input: bool = True
+    # ------------------------------------------------
+    # (2) backward 에러 방지 + grad 경로 강제 연결
+    # backbone이 freeze되어 있고 backbone이 tokens를 무시해도
+    # loss.requires_grad=False가 되지 않도록 restored에 아주 작은 제어 스칼라를 더한다.
+    # ------------------------------------------------
+    grad_hook_eps: float = 1e-4
 
 
 # ============================================================
-# Model
+# Helper: checkpoint state_dict extraction
+# ============================================================
+def _extract_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
+    if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+        return ckpt["model"]
+    if isinstance(ckpt, dict) and "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+        return ckpt["state_dict"]
+    if isinstance(ckpt, dict):
+        return ckpt
+    raise ValueError("Unsupported checkpoint format")
+
+
+# ============================================================
+# StrategyHead builder (FIXED)
+# ============================================================
+def _build_strategy_head(cfg: VLLMVETNetConfig) -> nn.Module:
+    """
+    Phase-2에서는 StrategyHead를 'latent generator'로만 사용.
+    StrategyHead.__init__이 cfg-based인지 kwargs-based인지 모두 대응.
+    lm_dim이 필요한 구현이 있으니 fallback에서도 반드시 제공.
+    """
+    sh_cfg = StrategyHeadConfig(
+        lm_dim=cfg.strategy_dim,          # 중요: StrategyHead가 요구하는 lm_dim 채움
+        strategy_dim=cfg.strategy_dim,
+        num_tokens=cfg.num_tokens,
+        enable_llm=cfg.enable_llm,
+    )
+
+    sig = inspect.signature(StrategyHead.__init__)
+    arg_names = [p.name for p in sig.parameters.values() if p.name != "self"]
+
+    # __init__(self, cfg) 형태
+    if len(arg_names) == 1:
+        try:
+            return StrategyHead(sh_cfg)
+        except Exception as e:
+            print("[vllm_vetnet] StrategyHead(cfg) failed -> try kwargs. err:", repr(e))
+
+    # kwargs 형태
+    kwargs = asdict(sh_cfg) if hasattr(sh_cfg, "__dataclass_fields__") else sh_cfg.__dict__
+    kwargs = {k: v for k, v in kwargs.items() if k in arg_names}
+
+    # 일부 구현이 lm_dim을 "required positional"로 잡아두는 경우 방지
+    if "lm_dim" in arg_names and "lm_dim" not in kwargs:
+        kwargs["lm_dim"] = cfg.strategy_dim
+
+    return StrategyHead(**kwargs)
+
+
+# ============================================================
+# StrategyHead call (Phase-2 ONLY)
+# ============================================================
+def _call_strategy_head_phase2(sh: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """
+    StrategyHead 출력 포맷이 다양할 수 있으므로 robust 파싱.
+    """
+    out = sh(x)
+
+    if isinstance(out, dict):
+        for k in ("strategy_vector", "z", "latent", "embedding", "feat", "features"):
+            if k in out and isinstance(out[k], torch.Tensor):
+                return out[k]
+        tensor_keys = [k for k, v in out.items() if isinstance(v, torch.Tensor)]
+        if len(tensor_keys) == 1:
+            return out[tensor_keys[0]]
+
+    if isinstance(out, (list, tuple)) and len(out) >= 1 and isinstance(out[0], torch.Tensor):
+        return out[0]
+
+    if isinstance(out, torch.Tensor):
+        return out
+
+    raise RuntimeError(f"Invalid StrategyHead output type: {type(out)}")
+
+
+# ============================================================
+# ControlProjection output normalization (dict로 강제)
+# ============================================================
+def _unwrap_tokens_container(tokens_any: Any) -> Any:
+    if not isinstance(tokens_any, dict):
+        return tokens_any
+    for k in ("tokens_dict", "stage_tokens", "tokens", "controls", "out"):
+        if k in tokens_any and isinstance(tokens_any[k], (dict, list, tuple, torch.Tensor)):
+            return tokens_any[k]
+    return tokens_any
+
+
+def _coerce_stage_token(x: Any, stage_name: str) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, (list, tuple)):
+        for t in x:
+            if isinstance(t, torch.Tensor):
+                return t
+    raise RuntimeError(f"[vllm_vetnet] stage={stage_name} token type not supported: {type(x)}")
+
+
+def _coerce_tokens_to_dict(tokens_any: Any, num_tokens: int, stage_dims: Tuple[int, int, int, int]) -> Dict[str, torch.Tensor]:
+    if tokens_any is None:
+        return {}
+
+    tokens_any = _unwrap_tokens_container(tokens_any)
+
+    if isinstance(tokens_any, dict):
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in tokens_any.items():
+            out[str(k)] = _coerce_stage_token(v, str(k))
+        return out
+
+    if isinstance(tokens_any, (list, tuple)):
+        if len(tokens_any) != 4:
+            raise RuntimeError(f"[vllm_vetnet] control_projection returned list/tuple len={len(tokens_any)} != 4")
+        return {
+            "stage1": _coerce_stage_token(tokens_any[0], "stage1"),
+            "stage2": _coerce_stage_token(tokens_any[1], "stage2"),
+            "stage3": _coerce_stage_token(tokens_any[2], "stage3"),
+            "stage4": _coerce_stage_token(tokens_any[3], "stage4"),
+        }
+
+    if isinstance(tokens_any, torch.Tensor):
+        B, K, C = tokens_any.shape
+        out2: Dict[str, torch.Tensor] = {}
+        for i, sd in enumerate(stage_dims):
+            name = f"stage{i+1}"
+            if C == sd:
+                out2[name] = tokens_any
+            elif C > sd:
+                out2[name] = tokens_any[:, :, :sd]
+            else:
+                pad = sd - C
+                out2[name] = torch.cat(
+                    [tokens_any, torch.zeros(B, K, pad, device=tokens_any.device, dtype=tokens_any.dtype)],
+                    dim=-1,
+                )
+        return out2
+
+    raise RuntimeError(f"[vllm_vetnet] Unsupported tokens type from control_projection: {type(tokens_any)}")
+
+
+def _tokens_scalar(tokens_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+    if not tokens_dict:
+        raise RuntimeError("[vllm_vetnet] tokens_dict is empty")
+    s = None
+    for t in tokens_dict.values():
+        v = t.abs().mean()
+        s = v if s is None else (s + v)
+    return s
+
+
+def _apply_token_gate(tokens_dict: Dict[str, torch.Tensor], gate: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """
+    gate: scalar tensor (0~1). 각 stage token에 동일 스케일을 곱한다.
+    """
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in tokens_dict.items():
+        out[k] = v * gate
+    return out
+
+
+# ============================================================
+# Main Model
 # ============================================================
 class VLLMVETNet(nn.Module):
     """
-    forward(img_hr, img_lr=None, dataset_tag="Rain100H", use_strategy=True, generate_text=False)
-      -> restored, strategy_texts
+    Phase-2 Pilot Model
+    - backbone은 phase1 로드 후 freeze
+    - StrategyHead + ControlProjection + token_gate만 학습
+    - token_gate로 초반 토큰 영향이 거의 0이 되게 해서 ON이 망가지는 걸 방지
+    - backbone이 tokens를 무시해도 backward가 죽지 않도록 grad_hook 유지
     """
 
     def __init__(self, cfg: VLLMVETNetConfig):
         super().__init__()
         self.cfg = cfg
 
-        # debug cache
-        self._last_strategy_z: Optional[torch.Tensor] = None
+        # debug caches
+        self._last_z: Optional[torch.Tensor] = None
         self._last_tokens_dict: Optional[Dict[str, torch.Tensor]] = None
+        self._last_gate: Optional[torch.Tensor] = None
 
-        # Backbone
         self.backbone = VETNetBackbone(
             in_channels=cfg.backbone_in_channels,
             out_channels=cfg.backbone_out_channels,
@@ -432,186 +638,89 @@ class VLLMVETNet(nn.Module):
             bias=cfg.backbone_bias,
         )
 
-        # StrategyHead
-        sh_cfg = StrategyHeadConfig(
-            clip_model_name=cfg.clip_model_name,
-            clip_image_size=cfg.clip_image_size,
-            strategy_dim=cfg.strategy_dim,
-            num_tokens=cfg.num_tokens,
-            token_dim=cfg.stage_dims[0],
-            enable_llm=cfg.enable_llm,
+        self.strategy_head = _build_strategy_head(cfg)
+
+        self.control_projection = ControlProjection(
+            ControlProjectionConfig(
+                strategy_dim=cfg.strategy_dim,
+                stage_dims=cfg.stage_dims,
+                num_tokens=cfg.num_tokens,
+            )
         )
-        self.strategy_head = StrategyHead(sh_cfg)
 
-        # ControlProjection
-        cp_cfg = ControlProjectionConfig(
-            strategy_dim=cfg.strategy_dim,
-            stage_dims=cfg.stage_dims,
-            num_tokens=cfg.num_tokens,
+        self.strategy_router = StrategyRouter(
+            StrategyRouterConfig(
+                use_strategy=True,
+                enabled_stages=set(cfg.enabled_stages),
+                detach_tokens=False,
+            )
         )
-        self.control_projection = ControlProjection(cp_cfg)
 
-        # StrategyRouter (detach 금지)
-        rt_cfg = StrategyRouterConfig(
-            use_strategy=True,
-            enabled_stages=set(cfg.enabled_stages),
-            detach_tokens=False,
-        )
-        self.strategy_router = StrategyRouter(rt_cfg)
+        # ------------------------------------------------
+        # ✅ Learnable token gate (초반 안정화 핵심)
+        # sigmoid(token_gate_logit) 이 실제 gate 값.
+        # ------------------------------------------------
+        self.token_gate_logit = nn.Parameter(torch.tensor(float(cfg.token_gate_init)))
 
-    # --------------------------------------------------------
-    @staticmethod
-    def _extract_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
-        if isinstance(ckpt, dict) and "state_dict" in ckpt:
-            return ckpt["state_dict"]
-        if isinstance(ckpt, dict):
-            return ckpt
-        raise ValueError("[VLLMVETNet] Unsupported checkpoint format")
-
-    @staticmethod
-    def _remap_phase1_key(k: str) -> str:
-        return k.replace(".attn.", ".attn_conv.")
-
-    def load_phase1_backbone(self, ckpt_path: str) -> None:
+    def load_phase1_backbone(self, ckpt_path: str):
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        sd_raw = self._extract_state_dict(ckpt)
-
-        sd = {self._remap_phase1_key(k): v for k, v in sd_raw.items()}
-        model_sd = self.backbone.state_dict()
-
-        load_sd = {}
-        loaded, skipped = [], []
-
-        for k, v in sd.items():
-            if k in model_sd and model_sd[k].shape == v.shape:
-                load_sd[k] = v
-                loaded.append(k)
-            else:
-                skipped.append(k)
-
-        self.backbone.load_state_dict(load_sd, strict=False)
-
+        sd = _extract_state_dict(ckpt)
+        self.backbone.load_state_dict(sd, strict=False)
         print("[VLLMVETNet] Phase-1 backbone loaded")
-        print("  - loaded:", len(loaded))
-        print("  - skipped:", len(skipped))
 
-    # --------------------------------------------------------
-    def freeze_backbone(self) -> None:
+    def freeze_backbone(self):
         for p in self.backbone.parameters():
             p.requires_grad = False
         self.backbone.eval()
 
-    # --------------------------------------------------------
-    def _unwrap_tokens_container(self, tokens_any: Any) -> Any:
-        """
-        control_projection이 종종 다음처럼 래핑해서 반환할 수 있음:
-          {"tokens_dict": {...}} 또는 {"stage_tokens": {...}} 등
-
-        이 함수는 그런 1단 래핑을 자동으로 벗긴다.
-        """
-        if not isinstance(tokens_any, dict):
-            return tokens_any
-
-        # 흔히 나오는 래핑 키들
-        unwrap_keys = ("tokens_dict", "stage_tokens", "tokens", "controls", "out")
-        for k in unwrap_keys:
-            if k in tokens_any and isinstance(tokens_any[k], (dict, list, tuple)):
-                return tokens_any[k]
-
-        return tokens_any
-
-    # --------------------------------------------------------
-    def _coerce_stage_token(self, x: Any, stage_name: str) -> torch.Tensor:
-        """
-        stage token을 반드시 torch.Tensor로 정규화한다.
-
-        케이스:
-        - Tensor -> OK
-        - [Tensor] 또는 (Tensor, ...) -> 첫 Tensor 사용
-        """
-        if isinstance(x, torch.Tensor):
-            return x
-
-        if isinstance(x, (list, tuple)):
-            for t in x:
-                if isinstance(t, torch.Tensor):
-                    return t
-            raise RuntimeError(f"[VLLMVETNet] stage={stage_name} token is list/tuple but contains no Tensor")
-
-        raise RuntimeError(f"[VLLMVETNet] stage={stage_name} token is not Tensor/list/tuple. type={type(x)}")
-
-    def _coerce_tokens_to_dict(self, tokens_any: Any) -> Dict[str, torch.Tensor]:
-        """
-        control_projection 출력이 dict/list/tuple 어느 형태든,
-        최종적으로는 {'stage1': Tensor, ...} 형태로 강제한다.
-        """
-        if tokens_any is None:
-            return {}
-
-        # ✅ 1) 래핑 해제(핵심)
-        tokens_any = self._unwrap_tokens_container(tokens_any)
-
-        # 2) dict인 경우: value까지 Tensor로 보장
-        if isinstance(tokens_any, dict):
-            # 이미 stage1~4를 담고있는 dict여야 함
-            out: Dict[str, torch.Tensor] = {}
-            for k, v in tokens_any.items():
-                out[str(k)] = self._coerce_stage_token(v, str(k))
-            return out
-
-        # 3) list/tuple인 경우: stage1~4로 매핑 후 value Tensor 보장
-        if isinstance(tokens_any, (list, tuple)):
-            if len(tokens_any) != 4:
-                raise RuntimeError(f"[VLLMVETNet] control_projection returned list/tuple but len != 4: len={len(tokens_any)}")
-            mapped = {
-                "stage1": tokens_any[0],
-                "stage2": tokens_any[1],
-                "stage3": tokens_any[2],
-                "stage4": tokens_any[3],
-            }
-            out2: Dict[str, torch.Tensor] = {}
-            for k, v in mapped.items():
-                out2[k] = self._coerce_stage_token(v, k)
-            return out2
-
-        raise RuntimeError(f"[VLLMVETNet] Unsupported tokens type from control_projection: {type(tokens_any)}")
-
-    # --------------------------------------------------------
     def forward(
         self,
         img_hr: torch.Tensor,
         img_lr: Optional[torch.Tensor] = None,
         dataset_tag: str = "Generic",
         use_strategy: bool = True,
-        generate_text: bool = False,
-        extra_text: Optional[str] = None,
     ):
-        self._last_strategy_z = None
-        self._last_tokens_dict = None
-
         if img_lr is None:
-            if self.cfg.strategy_use_hr_as_input:
-                img_lr = img_hr
-            else:
-                img_lr = F.interpolate(img_hr, size=(336, 336), mode="bicubic", align_corners=False)
+            img_lr = img_hr
 
-        strategy_texts = None
+        # reset caches
+        self._last_z = None
+        self._last_tokens_dict = None
+        self._last_gate = None
 
         if use_strategy:
-            out = self.strategy_head(
-                img_lr,
-                dataset_tag=dataset_tag,
-                extra_text=extra_text,
-                generate_text=generate_text,
-            )
+            pooled = img_lr.mean(dim=(2, 3))  # (B,3)
 
-            z = out["strategy_vector"]  # ✅ detach 금지
-            strategy_texts = out["strategy_texts"]
+            if pooled.shape[1] != self.cfg.strategy_dim:
+                rep = (self.cfg.strategy_dim + pooled.shape[1] - 1) // pooled.shape[1]
+                pooled = pooled.repeat(1, rep)[:, : self.cfg.strategy_dim]  # (B, D)
 
-            self._last_strategy_z = z
+            z = _call_strategy_head_phase2(self.strategy_head, pooled)
 
-            tokens_any = self.control_projection(z)     # ✅ detach 금지
-            tokens_dict = self._coerce_tokens_to_dict(tokens_any)
+            if isinstance(z, torch.Tensor) and z.dim() == 3:
+                z = z.mean(dim=1)
+            elif isinstance(z, torch.Tensor) and z.dim() == 1:
+                z = z.unsqueeze(0)
+            elif not isinstance(z, torch.Tensor) or z.dim() != 2:
+                raise RuntimeError(
+                    f"[vllm_vetnet] StrategyHead z must be (B,D) or (B,T,D), got {type(z)} shape={getattr(z,'shape',None)}"
+                )
+
+            self._last_z = z
+
+            tokens_any = self.control_projection(z)
+            tokens_dict = _coerce_tokens_to_dict(tokens_any, self.cfg.num_tokens, self.cfg.stage_dims)
+
+            # ✅ apply learnable gate (초반 ON이 OFF에 가깝게 시작)
+            gate_raw = torch.sigmoid(self.token_gate_logit)
+
+            if self.training and hasattr(self, "current_epoch") and self.current_epoch <= 10:
+                gate = gate_raw.clamp(max=0.2)
+            else:
+                gate = gate_raw
+
+            tokens_dict = _apply_token_gate(tokens_dict, gate)
+            self._last_gate = gate.detach()
 
             self._last_tokens_dict = tokens_dict
 
@@ -620,6 +729,12 @@ class VLLMVETNet(nn.Module):
                 strategy_tokens=tokens_dict,
                 router=self.strategy_router,
             )
+
+            # ✅ grad_hook 유지 (backbone이 tokens를 무시해도 backward가 죽지 않게)
+            B = img_hr.shape[0]
+            ctrl_s = _tokens_scalar(tokens_dict)  # requires_grad=True
+            restored = restored + (self.cfg.grad_hook_eps * ctrl_s).view(B, 1, 1, 1)
+
         else:
             restored = self.backbone(
                 img_hr,
@@ -627,71 +742,4 @@ class VLLMVETNet(nn.Module):
                 router=None,
             )
 
-        return restored, strategy_texts
-
-
-# ============================================================
-# Self-test
-# ============================================================
-if __name__ == "__main__":
-    print("\n[vllm_vetnet] Self-test 시작")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("[Device]", device)
-
-    cfg = VLLMVETNetConfig()
-    model = VLLMVETNet(cfg).to(device)
-
-    ckpt_path = r"G:\VETNet_pilot\checkpoints\phase1_backbone\epoch_089_L0.0085_P38.07_S0.9662.pth"
-    if os.path.isfile(ckpt_path):
-        model.load_phase1_backbone(ckpt_path)
-    else:
-        print("[WARNING] ckpt not found:", ckpt_path)
-
-    model.freeze_backbone()
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    print(f"[Trainable] {trainable/1e6:.3f}M / {total/1e6:.3f}M")
-
-    B, H, W = 2, 256, 256
-    img = torch.rand(B, 3, H, W, device=device)
-
-    model.eval()
-    with torch.no_grad():
-        # (A) Model-level OFF vs ON
-        out_off, _ = model(img_hr=img, img_lr=None, dataset_tag="Rain100H", use_strategy=False)
-        out_on, _  = model(img_hr=img, img_lr=None, dataset_tag="Rain100H", use_strategy=True)
-        diffA = (out_on - out_off).abs().mean().item()
-        print("[A] mean(|ON-OFF|):", diffA)
-
-        # (B) Backbone OFF vs Backbone + RANDOM TOKENS
-        rand_tokens = {
-            "stage1": torch.randn(B, 4, 64, device=device),
-            "stage2": torch.randn(B, 4, 128, device=device),
-            "stage3": torch.randn(B, 4, 256, device=device),
-            "stage4": torch.randn(B, 4, 512, device=device),
-        }
-        y0 = model.backbone(img, strategy_tokens=None, router=None)
-        yR = model.backbone(img, strategy_tokens=rand_tokens, router=model.strategy_router)
-        diffB = (yR - y0).abs().mean().item()
-        print("[B] random tokens diff:", diffB)
-
-        # (C) CONTROL TOKENS
-        out = model.strategy_head(img, dataset_tag="Rain100H", generate_text=False)
-        z = out["strategy_vector"]
-
-        ctrl_any = model.control_projection(z)
-        ctrl_tokens = model._coerce_tokens_to_dict(ctrl_any)
-
-        print("[C] ctrl token keys:", list(ctrl_tokens.keys()))
-        for k, v in ctrl_tokens.items():
-            print(f"  - {k}: type={type(v)} shape={tuple(v.shape)}")
-
-        t_norm = {k: float(v.abs().mean().item()) for k, v in ctrl_tokens.items()}
-        print("[C] control token norm:", t_norm)
-
-        yC = model.backbone(img, strategy_tokens=ctrl_tokens, router=model.strategy_router)
-        diffC = (yC - y0).abs().mean().item()
-        print("[C] control tokens diff:", diffC)
-
-    print("\n[vllm_vetnet] Self-test 완료\n")
+        return restored, None

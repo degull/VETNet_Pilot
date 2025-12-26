@@ -1,4 +1,4 @@
-# G:/VETNet_pilot/models/backbone/vetnet_backbone.py
+""" # G:/VETNet_pilot/models/backbone/vetnet_backbone.py
 # phase -1 (vetnet backbone)
 import os, sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -199,7 +199,7 @@ if __name__ == "__main__":
     print(f"Output Shape: {y.shape}")
     assert y.shape == x.shape, "입력과 출력 해상도가 일치해야 합니다!"
     print(">> VETNetBackbone Phase1: OK (입력/출력 shape 일치)")
-
+ """
 
 # phase -2 (control bridge)
 # G:/VETNet_pilot/models/backbone/vetnet_backbone.py
@@ -356,6 +356,7 @@ if __name__ == "__main__":
 """ 
 
 # phase 2
+
 import os, sys
 from typing import Optional, Dict, TYPE_CHECKING
 
