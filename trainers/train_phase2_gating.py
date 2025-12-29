@@ -10,6 +10,7 @@
 #     batch keys: "input", "gt"
 # ------------------------------------------------------------
 
+# full code
 import os, sys, time
 import torch
 import torch.nn as nn
@@ -41,7 +42,7 @@ except:
 class Config:
     # Phase-1과 동일하게 사용 (분포 고정)
     cache_root = "E:/VETNet_Pilot/preload_cache"
-    crop_size = 192  # Phase-1: size=256
+    crop_size = 256  # Phase-1: size=256
 
     # Phase-1 checkpoint
     phase1_ckpt = r"E:\VETNet_Pilot\checkpoints\phase1_backbone\epoch_021_L0.0204_P31.45_S0.9371.pth"
@@ -53,8 +54,8 @@ class Config:
     os.makedirs(log_root, exist_ok=True)
 
     # Train
-    epochs = 30
-    batch_size = 8
+    epochs = 5
+    batch_size = 4
     num_workers = 0
     lr = 2e-4
     weight_decay = 1e-4
@@ -78,12 +79,7 @@ def freeze_module(m: nn.Module):
 
 
 def safe_load_state_dict(model: nn.Module, ckpt_path: str):
-    """
-    Robust checkpoint loader supporting:
-      - {'model': state_dict, ...}
-      - {'state_dict': state_dict, ...}
-      - raw state_dict
-    """
+
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
     if isinstance(ckpt, dict):
@@ -113,9 +109,6 @@ def tensor_to_img_uint8(t):
 
 
 def compute_psnr_ssim(pred, gt):
-    """
-    Phase-1과 동일한 방식: 배치 첫 장 기준
-    """
     if not USE_SKIMAGE:
         return 0.0, 0.0
     p = tensor_to_img_uint8(pred[0])
@@ -126,9 +119,6 @@ def compute_psnr_ssim(pred, gt):
 
 
 def gate_stats(g):
-    """
-    g: [B,S]
-    """
     return {
         "g_mean": float(g.mean().item()),
         "g_min": float(g.min().item()),
