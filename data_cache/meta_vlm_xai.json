@@ -1,0 +1,72 @@
+{
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000354_in.png": {
+    "xai_llm": "This image was taken from a window of a building in a city. There is snow falling from the sky, which makes it difficult to see the buildings clearly.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000354_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000355_in.png": {
+    "xai_llm": "The image shows a snow-covered city street with cars driving down the street and buildings in the background. There is a lot of snow falling in the image, which makes it difficult for people to see clearly.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000355_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000356_in.png": {
+    "xai_llm": "This image was taken during a snowstorm, which means that there is a lot of snow falling on the ground. There is also a tree in the background of the image, which is likely a result of the heavy snowfall.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000356_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000357_in.png": {
+    "xai_llm": "the image shows a snow-covered street with buildings and a sign that reads'snow' in chinese.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000357_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000358_in.png": {
+    "xai_llm": "This image was taken from a window of a building in a city. There is snow falling from the sky, which makes it difficult to see the buildings clearly.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000358_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000359_in.png": {
+    "xai_llm": "This image was taken from a window of a building in a city. There is a lot of snow falling from the sky, which makes it difficult to see what is going on around the buildings.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000359_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000360_in.png": {
+    "xai_llm": "a photo of a city with snow falling on the ground and a skyscraper in the background.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000360_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000361_in.png": {
+    "xai_llm": "This image shows a cityscape with snow falling from the sky, which is a common occurrence in many cities around the world.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000361_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000362_in.png": {
+    "xai_llm": "This image was taken from a window of a building in a city. There is a lot of snow falling from the sky, which makes it difficult to see what is going on in the image.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000362_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  },
+  "E:\\VETNet_Pilot\\preload_cache\\CSD\\000363_in.png": {
+    "xai_llm": "- Final text only.",
+    "gt": "E:\\VETNet_Pilot\\preload_cache\\CSD\\000363_gt.png",
+    "dataset": "CSD",
+    "xai_source": "image-conditioned VLM (ViT + Q-Former + LLM)",
+    "prompt_hint": "InstructBLIP conservative XAI (no caption tone, no low-level speculation, 2 sentences)"
+  }
+}
