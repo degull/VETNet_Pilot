@@ -10,15 +10,27 @@
 #     batch keys: "input", "gt"
 # ------------------------------------------------------------
 
-# full code
+# E:\VETNet_Pilot\trainers\train_phase2_gating.py
+# ------------------------------------------------------------
+# Phase-2 (Gating Controller Training)
+# - Load Phase-1 backbone checkpoint
+# - Freeze backbone completely
+# - Train GateController only
+# - Gates are applied to backbone macro stages (8 stages)
+# - Dataset creation follows Phase-1 style:
+#     dataset = MultiTaskDatasetCache(cache_root, size=crop_size)
+#     batch keys: "input", "gt"
+# - SPEED: Use a random Subset (e.g., 3000) for Phase-2
+# ------------------------------------------------------------
+
 import os, sys, time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-# AMP: Phase-1 used torch.cuda.amp; keep consistent & stable
+# AMP: keep consistent with Phase-1
 from torch.cuda.amp import autocast, GradScaler
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -40,9 +52,9 @@ except:
 # Config
 # ---------------------------
 class Config:
-    # Phase-1과 동일하게 사용 (분포 고정)
+    # Phase-1 cache
     cache_root = "E:/VETNet_Pilot/preload_cache"
-    crop_size = 256  # Phase-1: size=256
+    crop_size = 192  # ✅ Phase-2 can be smaller (global measurement)
 
     # Phase-1 checkpoint
     phase1_ckpt = r"E:\VETNet_Pilot\checkpoints\phase1_backbone\epoch_021_L0.0204_P31.45_S0.9371.pth"
@@ -59,8 +71,11 @@ class Config:
     num_workers = 0
     lr = 2e-4
     weight_decay = 1e-4
-
     use_amp = True
+
+    # ✅ SPEED: Phase-2 subset
+    subset_size = 3000
+    subset_seed = 123  # fixed seed for reproducibility
 
     # IMPORTANT: must match backbone macro stages (=8)
     num_stages = VETNetBackbone.NUM_MACRO_STAGES
@@ -79,7 +94,12 @@ def freeze_module(m: nn.Module):
 
 
 def safe_load_state_dict(model: nn.Module, ckpt_path: str):
-
+    """
+    Robust checkpoint loader supporting:
+      - {'model': state_dict, ...}
+      - {'state_dict': state_dict, ...}
+      - raw state_dict
+    """
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
     if isinstance(ckpt, dict):
@@ -88,8 +108,7 @@ def safe_load_state_dict(model: nn.Module, ckpt_path: str):
         elif "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
             sd = ckpt["state_dict"]
         else:
-            # maybe dict itself is state_dict
-            sd = ckpt
+            sd = ckpt  # maybe dict itself is a state_dict
     else:
         sd = ckpt
 
@@ -109,6 +128,9 @@ def tensor_to_img_uint8(t):
 
 
 def compute_psnr_ssim(pred, gt):
+    """
+    Phase-1 style: batch first image only (fast).
+    """
     if not USE_SKIMAGE:
         return 0.0, 0.0
     p = tensor_to_img_uint8(pred[0])
@@ -119,6 +141,9 @@ def compute_psnr_ssim(pred, gt):
 
 
 def gate_stats(g):
+    """
+    g: [B,S]
+    """
     return {
         "g_mean": float(g.mean().item()),
         "g_min": float(g.min().item()),
@@ -144,6 +169,24 @@ def save_controller_ckpt(controller, epoch, epoch_loss, epoch_psnr, epoch_ssim, 
     return ckpt_path
 
 
+def build_subset_dataset(full_dataset, subset_size: int, seed: int):
+    """
+    Build a fixed random subset for Phase-2 speed.
+    - Uses torch.Generator for reproducibility
+    - If subset_size >= len(full_dataset), returns full_dataset
+    """
+    n = len(full_dataset)
+    if subset_size is None or subset_size <= 0 or subset_size >= n:
+        print(f"[Phase2] Using FULL dataset (n={n})")
+        return full_dataset
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+    indices = torch.randperm(n, generator=g)[:subset_size].tolist()
+    print(f"[Phase2] Using SUBSET: {subset_size}/{n} (seed={seed})")
+    return Subset(full_dataset, indices)
+
+
 # ---------------------------
 # Train
 # ---------------------------
@@ -152,9 +195,13 @@ def train():
     print("[Phase2] device:", device)
 
     # ============================================================
-    # 1) Dataset / Loader  (Phase-1과 동일!)
+    # 1) Dataset / Loader (Phase-1 style + Subset)
     # ============================================================
-    dataset = MultiTaskDatasetCache(cfg.cache_root, size=cfg.crop_size)
+    full_dataset = MultiTaskDatasetCache(cfg.cache_root, size=cfg.crop_size)
+    print("[CACHE DATASET] Total cached pairs =", len(full_dataset))
+
+    dataset = build_subset_dataset(full_dataset, cfg.subset_size, cfg.subset_seed)
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
@@ -163,7 +210,8 @@ def train():
         pin_memory=True,
         drop_last=True,
     )
-    print("[Phase2] Total cached samples =", len(dataset))
+    print("[Phase2] Total train samples =", len(dataset))
+    print("[Phase2] Steps per epoch =", len(loader))
 
     # ============================================================
     # 2) Backbone (Frozen) + Load Phase-1 ckpt
@@ -171,13 +219,14 @@ def train():
     backbone = VETNetBackbone(
         in_channels=3,
         out_channels=3,
-        dim=64,                      # ⭐ Phase-1과 동일
+        dim=64,                      # ⭐ MUST match Phase-1
         num_blocks=(4, 6, 6, 8),
         heads=(1, 2, 4, 8),
         volterra_rank=4,
         ffn_expansion_factor=2.66,
         bias=False,
     ).to(device)
+
     safe_load_state_dict(backbone, cfg.phase1_ckpt)
     backbone.eval()
     freeze_module(backbone)
@@ -201,7 +250,6 @@ def train():
     # ============================================================
     for epoch in range(1, cfg.epochs + 1):
         t0 = time.time()
-
         controller.train()
 
         loss_sum = 0.0
@@ -212,28 +260,26 @@ def train():
         g_stats_accum = None
 
         pbar = tqdm(loader, ncols=120, desc=f"Epoch {epoch:03d}/{cfg.epochs}")
-
         for batch in pbar:
-            # Phase-1과 동일한 키 사용
+            # Phase-1 keys
             inp = batch["input"].to(device, non_blocking=True)
             gt  = batch["gt"].to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
 
             with autocast(enabled=cfg.use_amp):
-                g_stage = controller(inp)                   # [B,8]
-                pred = backbone(inp, g_stage=g_stage)       # gated forward
+                g_stage = controller(inp)              # [B,8]
+                pred = backbone(inp, g_stage=g_stage)  # gated forward
                 loss = F.l1_loss(pred, gt)
 
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
 
-            # Metrics (Phase-1과 동일: 첫 장 기준)
+            # Metrics (Phase-1 style: first image)
             with torch.no_grad():
                 pred_c = pred.clamp(0, 1)
                 gt_c = gt.clamp(0, 1)
-
                 ps, ss = compute_psnr_ssim(pred_c, gt_c)
 
                 loss_sum += float(loss.item())
@@ -280,7 +326,7 @@ def train():
             g_stats_accum["g_var_stage"] = [v / steps for v in g_stats_accum["g_var_stage"]]
             g_stats_accum["g_mean_stage"] = [v / steps for v in g_stats_accum["g_mean_stage"]]
 
-        # save
+        # save controller ckpt
         ckpt_path = save_controller_ckpt(controller, epoch, epoch_loss, epoch_psnr, epoch_ssim, cfg.save_root)
 
         # log
