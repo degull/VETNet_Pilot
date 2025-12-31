@@ -379,8 +379,7 @@ class Phase3CachedClipVisionDataset(Dataset):
         if xai_blip is not None:
             sample["xai_blip"] = str(xai_blip)
         return sample
-
-
+    
 def build_subset_dataset(full_dataset: Dataset, subset_size: int, seed: int) -> Dataset:
     n = len(full_dataset)
     if subset_size is None or subset_size <= 0 or subset_size >= n:
