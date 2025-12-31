@@ -96,7 +96,7 @@ class Config:
 
     # Phase-2 teacher ckpt (optional)
     use_phase2_teacher: bool = True
-    phase2_ckpt: str = r"E:\VETNet_Pilot\checkpoints\phase2_gating\epoch_005_L0.0215_P31.25_S0.9371.pth"
+    phase2_ckpt: str = r"E:\VETNet_Pilot\checkpoints\phase2_gating\epoch_002_L0.0236_P30.42_S0.9293.pth"
 
     # Output
     save_root: str = "E:/VETNet_Pilot/checkpoints/phase3_vlm_clean"
@@ -637,7 +637,12 @@ def train():
     # 3) Teacher (optional)
     teacher = None
     if cfg.use_phase2_teacher and cfg.w_cons > 0:
-        teacher = GateController(num_stages=cfg.num_stages, g_min=cfg.g_min).to(device)
+        teacher = GateController(
+        num_stages=cfg.num_stages,
+        g_min=cfg.g_min,
+        hidden_dim=256   # ⭐ Phase-2와 반드시 동일
+    ).to(device)
+
         safe_load_phase2_controller(teacher, cfg.phase2_ckpt)
         teacher.eval()
         freeze_module(teacher)
